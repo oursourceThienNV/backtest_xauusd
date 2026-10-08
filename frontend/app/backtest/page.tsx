@@ -183,6 +183,159 @@ type AiProfitExitResult = {
  * The user only enables/disables it. Internal weights/thresholds are deliberately
  * hidden from the UI and can be optimized during backtest.
  */
+function buildAiFeatures(
+  candles: any[],
+  index: number,
+  side: 'BUY' | 'SELL',
+  entryPrice: number,
+  currentPrice: number,
+  tpPrice: number
+) {
+  const c = candles[index];
+
+  const atr = atrValue(candles, index);
+
+  const profit =
+    side === 'BUY'
+      ? currentPrice - entryPrice
+      : entryPrice - currentPrice;
+
+  const tpDistance = Math.abs(tpPrice - entryPrice);
+
+  const profitPct =
+    tpDistance > 0
+      ? profit / tpDistance
+      : 0;
+
+  const ema = (period: number, end: number) => {
+    const start = Math.max(0, end - period * 4);
+
+    let value = Number(candles[start].close);
+
+    const alpha = 2 / (period + 1);
+
+    for (let i = start + 1; i <= end; i++) {
+      value =
+        alpha * Number(candles[i].close) +
+        (1 - alpha) * value;
+    }
+
+    return value;
+  };
+
+  const ema9 = ema(9, index);
+  const ema21 = ema(21, index);
+  const ema9Prev = ema(9, index - 1);
+  const ema21Prev = ema(21, index - 1);
+
+  const emaGap =
+    side === 'BUY'
+      ? ema9 - ema21
+      : ema21 - ema9;
+
+  const emaGapChange =
+    side === 'BUY'
+      ? (ema9 - ema21) -
+        (ema9Prev - ema21Prev)
+      : (ema21 - ema9) -
+        (ema21Prev - ema9Prev);
+
+  const body =
+    Math.abs(
+      Number(c.close) -
+      Number(c.open)
+    );
+
+  const range =
+    Math.max(
+      Number(c.high) -
+      Number(c.low),
+      0.00000001
+    );
+
+  const closeLocation =
+    (Number(c.close) -
+      Number(c.low)) /
+    range;
+
+  const upperWick =
+    Number(c.high) -
+    Math.max(
+      Number(c.open),
+      Number(c.close)
+    );
+
+  const lowerWick =
+    Math.min(
+      Number(c.open),
+      Number(c.close)
+    ) -
+    Number(c.low);
+
+  const momentum3 =
+    side === 'BUY'
+      ? Number(c.close) -
+        Number(candles[Math.max(0, index - 3)].close)
+      : Number(candles[Math.max(0, index - 3)].close) -
+        Number(c.close);
+
+  const momentum5 =
+    side === 'BUY'
+      ? Number(c.close) -
+        Number(candles[Math.max(0, index - 5)].close)
+      : Number(candles[Math.max(0, index - 5)].close) -
+        Number(c.close);
+
+  return {
+    profitPct,
+
+    profitAtr:
+      atr > 0
+        ? profit / atr
+        : 0,
+
+    emaGapAtr:
+      atr > 0
+        ? emaGap / atr
+        : 0,
+
+    emaGapChangeAtr:
+      atr > 0
+        ? emaGapChange / atr
+        : 0,
+
+    momentum3Atr:
+      atr > 0
+        ? momentum3 / atr
+        : 0,
+
+    momentum5Atr:
+      atr > 0
+        ? momentum5 / atr
+        : 0,
+
+    bodyAtr:
+      atr > 0
+        ? body / atr
+        : 0,
+
+    bodyRatio:
+      body / range,
+
+    closeLocation,
+
+    upperWickRatio:
+      upperWick / range,
+
+    lowerWickRatio:
+      lowerWick / range,
+
+    rangeAtr:
+      atr > 0
+        ? range / atr
+        : 0,
+  };
+}
 function aiProfitExitDecision(
   candles: any[],
   index: number,
@@ -190,97 +343,925 @@ function aiProfitExitDecision(
   entryPrice: number,
   currentPrice: number,
   tpPrice?: number,
-  threshold = 7,
 ): AiProfitExitResult {
-  if (index < 25) return { action: 'HOLD', score: 0, reasons: [] };
+  const HOLD = (
+    score: number,
+    reasons: string[],
+  ): AiProfitExitResult => ({
+    action: 'HOLD',
+    score,
+    reasons,
+  });
 
-  const direction = side === 'BUY' ? 1 : -1;
-  const profit = (currentPrice - entryPrice) * direction;
-  if (profit <= 0) return { action: 'HOLD', score: 0, reasons: [] };
+  const PROTECT = (
+    score: number,
+    reasons: string[],
+  ): AiProfitExitResult => ({
+    action: 'PROTECT',
+    score,
+    reasons,
+  });
+
+  const CLOSE = (
+    score: number,
+    reasons: string[],
+  ): AiProfitExitResult => ({
+    action: 'CLOSE',
+    score,
+    reasons,
+  });
+
+  // ============================================================
+  // 1. BASIC VALIDATION
+  // ============================================================
+
+  if (
+    !candles ||
+    index < 30 ||
+    index >= candles.length
+  ) {
+    return HOLD(0, ['Chưa đủ dữ liệu']);
+  }
 
   const current = candles[index];
   const prev = candles[index - 1];
   const prev2 = candles[index - 2];
-  const reasons: string[] = [];
-  let score = 0;
+  const prev3 = candles[index - 3];
 
-  // Trend reversal / EMA deterioration.
-  const e9Now = Number(current.ema_fast ?? current.ma_fast ?? current.close);
-  const e21Now = Number(current.ema_slow ?? current.ma_slow ?? current.close);
-  const e9Past = Number(candles[index - 3].ema_fast ?? candles[index - 3].ma_fast ?? candles[index - 3].close);
-  const e21Past = Number(candles[index - 1].ema_slow ?? candles[index - 1].ma_slow ?? candles[index - 1].close);
-  const e9Prev = Number(candles[index - 1].ema_fast ?? candles[index - 1].ma_fast ?? candles[index - 1].close);
-  const emaSlope = (e9Now - e9Past) * direction;
-  const emaGap = (e9Now - e21Now) * direction;
-  const prevGap = (e9Prev - e21Past) * direction;
-  if (emaSlope < 0) { score += 2; reasons.push('EMA momentum suy yếu'); }
-  if (emaGap < 0) { score += 2; reasons.push('EMA trend không còn ủng hộ'); }
-  else if (prevGap > 0 && emaGap < prevGap * 0.55) { score += 1.5; reasons.push('Khoảng cách EMA co lại'); }
-
-  // Candle weakness / reversal.
-  const cp = bodyPower(candles, index);
-  const currentBody = Math.abs(Number(current.close) - Number(current.open));
-  const prevBody = Math.abs(Number(prev.close) - Number(prev.open));
-  const favorableCurrent = (Number(current.close) - Number(current.open)) * direction > 0;
-  const favorablePrev = (Number(prev.close) - Number(prev.open)) * direction > 0;
-  if (cp > 0 && cp < 0.65) { score += 1.5; reasons.push('Candle yếu'); }
-  if (favorablePrev && !favorableCurrent) { score += 2; reasons.push('Candle mất hướng'); }
-  if (currentBody < prevBody * 0.55 && prevBody > 0) { score += 1; reasons.push('Biên độ candle giảm'); }
-
-  // Short-term momentum.
-  const m3 = (Number(current.close) - Number(candles[index - 3].close)) * direction;
-  const m6 = (Number(current.close) - Number(candles[index - 6].close)) * direction;
-  const atr = atrValue(candles, index);
-  if (atr > 0 && m3 < atr * 0.15) { score += 1.5; reasons.push('Momentum ngắn hạn yếu'); }
-  if (atr > 0 && m6 < 0) { score += 2; reasons.push('Momentum đang đảo chiều'); }
-
-  // RSI exhaustion, used as a supporting factor only.
-  const rsi = rsiValue(candles, index);
-  if ((side === 'BUY' && rsi >= 72) || (side === 'SELL' && rsi <= 28)) {
-    score += 1.5;
-    reasons.push(`RSI cực trị ${rsi.toFixed(0)}`);
+  if (
+    !current ||
+    !prev ||
+    !prev2 ||
+    !prev3
+  ) {
+    return HOLD(0, ['Thiếu candle']);
   }
 
-  // Profit maturity: do not close merely because profit is positive.
-  if (tpPrice) {
-    const total = Math.abs(tpPrice - entryPrice);
-    const reached = total > 0 ? Math.abs(currentPrice - entryPrice) / total : 0;
-    if (reached >= 0.75) { score += 1; reasons.push('Đã đạt phần lớn TP'); }
-    if (reached >= 0.95) { score += 1; reasons.push('Rất gần TP'); }
-  } else if (atr > 0 && profit >= atr * 1.5) {
-    score += 1;
-    reasons.push('Profit đã lớn so với ATR');
+  const direction =
+    side === 'BUY'
+      ? 1
+      : -1;
+
+  const price = Number(currentPrice);
+
+  const profit =
+    (price - entryPrice) *
+    direction;
+
+  /*
+   * AI Profit Exit chỉ xử lý lệnh đang lời.
+   */
+  if (
+    !Number.isFinite(profit) ||
+    profit <= 0
+  ) {
+    return HOLD(0, ['Chưa có profit']);
   }
 
-  // Reversal candle structure.
-  const prevMove = (Number(prev.close) - Number(prev2.close)) * direction;
-  const currentMove = (Number(current.close) - Number(prev.close)) * direction;
-  if (prevMove > 0 && currentMove < 0) {
-    score += 1.5;
-    reasons.push('Xuất hiện nến đảo chiều');
+  // ============================================================
+  // 2. PROFIT PROGRESS
+  // ============================================================
+
+  let profitProgress = 0;
+
+  if (
+    tpPrice !== undefined &&
+    Number.isFinite(tpPrice)
+  ) {
+    const tpDistance =
+      Math.abs(
+        tpPrice - entryPrice,
+      );
+
+    if (tpDistance > 0) {
+      profitProgress =
+        profit / tpDistance;
+    }
   }
 
-  const action: AiProfitExitResult['action'] = score >= threshold ? 'CLOSE' : score >= threshold - 2.5 ? 'PROTECT' : 'HOLD';
-  return { action, score, reasons };
+  /*
+   * Nếu không có TP thì dùng ATR làm fallback.
+   */
+  if (
+    profitProgress <= 0
+  ) {
+    const atrFallback =
+      atrValue(candles, index);
+
+    if (
+      Number.isFinite(atrFallback) &&
+      atrFallback > 0
+    ) {
+      profitProgress =
+        profit /
+        (atrFallback * 1.5);
+    }
+  }
+
+  /*
+   * Dưới 40% TP:
+   *
+   * Không cho AI đóng.
+   *
+   * Mục tiêu là tránh AI bị noise M1 đánh bật.
+   */
+  if (profitProgress < 0.40) {
+    return HOLD(
+      0,
+      [
+        `Profit ${Math.round(
+          profitProgress * 100,
+        )}% TP`,
+        'Profit chưa đủ để AI can thiệp',
+      ],
+    );
+  }
+
+  // ============================================================
+  // 3. ATR
+  // ============================================================
+
+  const atr =
+    atrValue(candles, index);
+
+  if (
+    !Number.isFinite(atr) ||
+    atr <= 0
+  ) {
+    return HOLD(
+      0,
+      ['ATR không hợp lệ'],
+    );
+  }
+
+  // ============================================================
+  // 4. CURRENT CANDLE
+  // ============================================================
+
+  const open =
+    Number(current.open);
+
+  const high =
+    Number(current.high);
+
+  const low =
+    Number(current.low);
+
+  const close =
+    Number(current.close);
+
+  const prevOpen =
+    Number(prev.open);
+
+  const prevHigh =
+    Number(prev.high);
+
+  const prevLow =
+    Number(prev.low);
+
+  const prevClose =
+    Number(prev.close);
+
+  const prev2Close =
+    Number(prev2.close);
+
+  const range =
+    Math.max(
+      high - low,
+      0.00000001,
+    );
+
+  const prevRange =
+    Math.max(
+      prevHigh - prevLow,
+      0.00000001,
+    );
+
+  const body =
+    Math.abs(
+      close - open,
+    );
+
+  const prevBody =
+    Math.abs(
+      prevClose - prevOpen,
+    );
+
+  const bodyRatio =
+    body / range;
+
+  const closeLocation =
+    (close - low) /
+    range;
+
+  const upperWick =
+    high -
+    Math.max(
+      open,
+      close,
+    );
+
+  const lowerWick =
+    Math.min(
+      open,
+      close,
+    ) -
+    low;
+
+  const upperWickRatio =
+    upperWick / range;
+
+  const lowerWickRatio =
+    lowerWick / range;
+
+  // ============================================================
+  // 5. EMA
+  //
+  // Dùng EMA đã được calcIndicators() tạo sẵn.
+  // Không gọi emaValue().
+  // ============================================================
+
+  const emaFast =
+    Number(
+      current.ema_fast ??
+      current.ma_fast ??
+      current.close,
+    );
+
+  const emaSlow =
+    Number(
+      current.ema_slow ??
+      current.ma_slow ??
+      current.close,
+    );
+
+  const emaFastPrev =
+    Number(
+      prev.ema_fast ??
+      prev.ma_fast ??
+      prev.close,
+    );
+
+  const emaSlowPrev =
+    Number(
+      prev.ema_slow ??
+      prev.ma_slow ??
+      prev.close,
+    );
+
+  const emaFastPast =
+    Number(
+      candles[index - 3].ema_fast ??
+      candles[index - 3].ma_fast ??
+      candles[index - 3].close,
+    );
+
+  const emaSlowPast =
+    Number(
+      candles[index - 3].ema_slow ??
+      candles[index - 3].ma_slow ??
+      candles[index - 3].close,
+    );
+
+  const emaGap =
+    (emaFast - emaSlow) *
+    direction;
+
+  const prevEmaGap =
+    (emaFastPrev - emaSlowPrev) *
+    direction;
+
+  const pastEmaGap =
+    (emaFastPast - emaSlowPast) *
+    direction;
+
+  /*
+   * EMA vẫn còn đúng hướng.
+   */
+  const emaStillAligned =
+    emaGap > 0;
+
+  /*
+   * EMA gap giảm mạnh.
+   */
+  const emaGapCollapse =
+    prevEmaGap > 0 &&
+    emaGap > 0 &&
+    emaGap <
+      prevEmaGap * 0.50;
+
+  /*
+   * EMA thực sự cross ngược.
+   */
+  const emaReversal =
+    emaGap < 0;
+
+  /*
+   * EMA slope đảo hướng mạnh.
+   */
+  const emaSlope =
+    (
+      (emaFast - emaFastPast) *
+      direction
+    ) / 3;
+
+  const strongEmaSlopeReversal =
+    emaSlope <
+    -atr * 0.08;
+
+  // ============================================================
+  // 6. MOMENTUM
+  // ============================================================
+
+  const close3 =
+    Number(
+      candles[index - 3].close,
+    );
+
+  const close5 =
+    Number(
+      candles[index - 5].close,
+    );
+
+  const close6 =
+    Number(
+      candles[index - 6].close,
+    );
+
+  const close10 =
+    Number(
+      candles[index - 10].close,
+    );
+
+  const momentum3 =
+    (
+      close -
+      close3
+    ) * direction;
+
+  const momentum5 =
+    (
+      close -
+      close5
+    ) * direction;
+
+  const momentum6 =
+    (
+      close -
+      close6
+    ) * direction;
+
+  const momentum10 =
+    (
+      close -
+      close10
+    ) * direction;
+
+  const momentum3Atr =
+    momentum3 / atr;
+
+  const momentum5Atr =
+    momentum5 / atr;
+
+  const momentum6Atr =
+    momentum6 / atr;
+
+  const momentum10Atr =
+    momentum10 / atr;
+
+  /*
+   * Momentum đảo chiều mạnh.
+   */
+  const strongMomentumReversal =
+    momentum3Atr <= -0.20 ||
+    momentum6Atr <= -0.30;
+
+  /*
+   * Momentum đảo chiều cực mạnh.
+   */
+  const extremeMomentumReversal =
+    momentum3Atr <= -0.30 ||
+    momentum5Atr <= -0.35 ||
+    momentum6Atr <= -0.45 ||
+    momentum10Atr <= -0.55;
+
+  // ============================================================
+  // 7. CANDLE POWER
+  // ============================================================
+
+  const cp =
+    bodyPower(
+      candles,
+      index,
+    );
+
+  /*
+   * Nến ngược hướng position.
+   */
+  const reversalCandle =
+    side === 'BUY'
+      ? close < open
+      : close > open;
+
+  /*
+   * Nến đảo chiều mạnh.
+   */
+  const strongReversalCandle =
+    reversalCandle &&
+    cp >= 1.30 &&
+    bodyRatio >= 0.55;
+
+  /*
+   * Nến đảo chiều cực mạnh.
+   */
+  const extremeReversalCandle =
+    reversalCandle &&
+    cp >= 1.70 &&
+    bodyRatio >= 0.65;
+
+  /*
+   * Range expansion.
+   */
+  const rangeExpansion =
+    range >=
+    prevRange * 1.20;
+
+  // ============================================================
+  // 8. STRUCTURE BREAK
+  // ============================================================
+
+  const previousLowest =
+    Math.min(
+      Number(prev.low),
+      Number(prev2.low),
+      Number(prev3.low),
+    );
+
+  const previousHighest =
+    Math.max(
+      Number(prev.high),
+      Number(prev2.high),
+      Number(prev3.high),
+    );
+
+  /*
+   * BUY:
+   * close phá low.
+   *
+   * SELL:
+   * close phá high.
+   */
+  const structureBreak =
+    side === 'BUY'
+      ? close < previousLowest
+      : close > previousHighest;
+
+  const strongStructureBreak =
+    structureBreak &&
+    bodyRatio >= 0.55 &&
+    rangeExpansion;
+
+  // ============================================================
+  // 9. PRICE MOMENTUM REVERSAL
+  // ============================================================
+
+  const previousMove =
+    (
+      prevClose -
+      prev2Close
+    ) * direction;
+
+  const currentMove =
+    (
+      close -
+      prevClose
+    ) * direction;
+
+  /*
+   * Candle trước còn đi đúng hướng,
+   * candle hiện tại quay ngược.
+   */
+  const priceReversal =
+    previousMove > 0 &&
+    currentMove < 0;
+
+  const strongPriceReversal =
+    currentMove <=
+    -atr * 0.15;
+
+  // ============================================================
+  // 10. WICK REJECTION
+  // ============================================================
+
+  /*
+   * BUY:
+   * upper wick lớn => bị reject ở đỉnh.
+   *
+   * SELL:
+   * lower wick lớn => bị reject ở đáy.
+   */
+  const strongRejection =
+    side === 'BUY'
+      ? upperWickRatio >= 0.50
+      : lowerWickRatio >= 0.50;
+
+  // ============================================================
+  // 11. RSI
+  //
+  // RSI KHÔNG được phép tự mình CLOSE.
+  // Chỉ dùng confirmation.
+  // ============================================================
+
+  const rsi =
+    rsiValue(
+      candles,
+      index,
+    );
+
+  const rsiPrev =
+    rsiValue(
+      candles,
+      index - 1,
+    );
+
+  const rsiExtreme =
+    side === 'BUY'
+      ? rsi >= 80
+      : rsi <= 20;
+
+  const rsiTurning =
+    side === 'BUY'
+      ? rsi < rsiPrev
+      : rsi > rsiPrev;
+
+  const strongRsiReversal =
+    rsiExtreme &&
+    rsiTurning;
+
+  // ============================================================
+  // 12. BUILD EXTREME REVERSAL SCORE
+  //
+  // Không phải score để "đoán".
+  //
+  // Score chỉ dùng để xác nhận nhiều tín hiệu cực mạnh
+  // cùng xuất hiện.
+  // ============================================================
+
+  let extremeScore = 0;
+
+  const reversalReasons: string[] = [];
+
+  if (emaReversal) {
+    extremeScore += 4;
+    reversalReasons.push(
+      'EMA9/21 cross ngược',
+    );
+  }
+
+  if (strongEmaSlopeReversal) {
+    extremeScore += 3;
+    reversalReasons.push(
+      'EMA slope đảo chiều mạnh',
+    );
+  }
+
+  if (emaGapCollapse) {
+    extremeScore += 2;
+    reversalReasons.push(
+      'EMA gap collapse',
+    );
+  }
+
+  if (strongMomentumReversal) {
+    extremeScore += 5;
+    reversalReasons.push(
+      'Momentum reversal mạnh',
+    );
+  }
+
+  if (extremeMomentumReversal) {
+    extremeScore += 5;
+    reversalReasons.push(
+      'Momentum reversal cực mạnh',
+    );
+  }
+
+  if (strongReversalCandle) {
+    extremeScore += 4;
+    reversalReasons.push(
+      'Candle reversal mạnh',
+    );
+  }
+
+  if (extremeReversalCandle) {
+    extremeScore += 5;
+    reversalReasons.push(
+      'Candle reversal cực mạnh',
+    );
+  }
+
+  if (structureBreak) {
+    extremeScore += 4;
+    reversalReasons.push(
+      'Break structure',
+    );
+  }
+
+  if (strongStructureBreak) {
+    extremeScore += 4;
+    reversalReasons.push(
+      'Break structure mạnh',
+    );
+  }
+
+  if (strongPriceReversal) {
+    extremeScore += 3;
+    reversalReasons.push(
+      'Price reversal mạnh',
+    );
+  }
+
+  if (strongRejection) {
+    extremeScore += 2;
+    reversalReasons.push(
+      'Strong rejection',
+    );
+  }
+
+  if (strongRsiReversal) {
+    extremeScore += 2;
+    reversalReasons.push(
+      'RSI extreme + turning',
+    );
+  }
+
+  // ============================================================
+  // 13. EXTREME REVERSAL
+  // ============================================================
+
+  /*
+   * CỰC QUAN TRỌNG:
+   *
+   * Không CLOSE chỉ vì score cao.
+   *
+   * Phải có ít nhất 1 trong các "hard trigger":
+   *
+   * A. Structure break mạnh
+   * B. Momentum cực mạnh
+   * C. Candle cực mạnh + momentum
+   * D. EMA cross + momentum
+   */
+
+  const hardStructureTrigger =
+    strongStructureBreak &&
+    (
+      strongMomentumReversal ||
+      strongReversalCandle ||
+      extremeMomentumReversal
+    );
+
+  const hardMomentumTrigger =
+    extremeMomentumReversal &&
+    (
+      structureBreak ||
+      strongReversalCandle ||
+      strongEmaSlopeReversal
+    );
+
+  const hardCandleTrigger =
+    extremeReversalCandle &&
+    (
+      strongMomentumReversal ||
+      structureBreak
+    );
+
+  const hardEmaTrigger =
+    emaReversal &&
+    (
+      strongMomentumReversal ||
+      strongStructureBreak ||
+      extremeReversalCandle
+    );
+
+  const extremeReversal =
+    hardStructureTrigger ||
+    hardMomentumTrigger ||
+    hardCandleTrigger ||
+    hardEmaTrigger;
+
+  // ============================================================
+  // 14. MINIMUM PROFIT FOR EXTREME REVERSAL
+  // ============================================================
+
+  /*
+   * Không cắt những lệnh mới lời tí.
+   *
+   * Muốn AI emergency exit thì phải:
+   *
+   * >= 60% TP
+   *
+   * hoặc profit >= 0.5 ATR.
+   */
+  const enoughProfit =
+    profitProgress >= 0.60 ||
+    profit >= atr * 0.50;
+
+  // ============================================================
+  // 15. EMERGENCY EXTREME REVERSAL
+  // ============================================================
+
+  if (
+    enoughProfit &&
+    extremeReversal
+  ) {
+    return CLOSE(
+      Math.max(
+        extremeScore,
+        10,
+      ),
+      [
+        `EMERGENCY REVERSAL`,
+        `Profit ${Math.round(
+          profitProgress * 100,
+        )}% TP`,
+        ...reversalReasons.slice(
+          0,
+          5,
+        ),
+      ],
+    );
+  }
+
+  // ============================================================
+  // 16. PROFIT COLLAPSE
+  //
+  // Phần này cần dữ liệu MFE từ caller.
+  //
+  // Nếu chưa truyền MFE:
+  // không tự đoán.
+  // ============================================================
+
+  /*
+   * aiProfitExitDecision hiện tại chưa biết maxProfit của trade.
+   *
+   * Caller sẽ truyền qua property tạm thời:
+   *
+   * (open as any).maxProfitDistance
+   *
+   * Nhưng để hàm vẫn tương thích với code cũ,
+   * lấy giá trị optional từ open không thể làm ở đây.
+   *
+   * Vì vậy phần collapse sẽ được xử lý ở managePosition().
+   */
+
+  // ============================================================
+  // 17. NORMAL REVERSAL
+  //
+  // Normal reversal KHÔNG CLOSE.
+  //
+  // Đây là thay đổi quan trọng.
+  // ============================================================
+
+  if (
+    strongMomentumReversal ||
+    strongReversalCandle ||
+    structureBreak ||
+    emaReversal
+  ) {
+    return PROTECT(
+      Math.max(
+        extremeScore,
+        1,
+      ),
+      [
+        `Profit ${Math.round(
+          profitProgress * 100,
+        )}% TP`,
+        'Có reversal nhưng chưa đủ cực mạnh',
+        ...reversalReasons.slice(
+          0,
+          4,
+        ),
+      ],
+    );
+  }
+
+  // ============================================================
+  // 18. TREND HEALTHY
+  //
+  // Trend vẫn khỏe => HOLD.
+  // ============================================================
+
+  const trendHealthy =
+    emaStillAligned &&
+    !emaGapCollapse &&
+    !strongMomentumReversal &&
+    !strongPriceReversal;
+
+  if (trendHealthy) {
+    return HOLD(
+      0,
+      [
+        `Profit ${Math.round(
+          profitProgress * 100,
+        )}% TP`,
+        'Trend vẫn khỏe',
+      ],
+    );
+  }
+
+  // ============================================================
+  // 19. DEFAULT
+  // ============================================================
+
+  return HOLD(
+    Math.max(
+      extremeScore,
+      0,
+    ),
+    [
+      `Profit ${Math.round(
+        profitProgress * 100,
+      )}% TP`,
+      'Không có extreme reversal',
+    ],
+  );
 }
+function calculateSlTp(
+  candles: any[],
+  index: number,
+  side: 'BUY' | 'SELL',
+  entry: number,
+) {
+  // Fixed RR = 1 : 0.9
+  const rr = 0.9;
 
-function calculateSlTp(candles: any[], index: number, side: 'BUY'|'SELL', entry: number, rr = 1.5) {
-  const start = Math.max(0, index - 9);
+  // Cần đủ 10 candle
+  if (index < 9) {
+    return null;
+  }
+
+  if (!Number.isFinite(entry) || entry <= 0) {
+    return null;
+  }
+
+  // 10 candle gần nhất, bao gồm candle hiện tại
+  const start = index - 9;
   const tail = candles.slice(start, index + 1);
-  const lows = tail.map(c => Number(c.low)).filter(Number.isFinite);
-  const highs = tail.map(c => Number(c.high)).filter(Number.isFinite);
-  const atr = atrValue(candles, index) || Math.abs(entry) * 0.001;
-  const buffer = atr * 0.10;
-  const baseSl = side === 'BUY' ? Math.min(...lows) - buffer : Math.max(...highs) + buffer;
-  const baseRisk = Math.max(Math.abs(entry - baseSl), atr * 0.25);
-  // Deterministic 10%-15% extension. The live engine uses random.uniform(0.10, 0.15);
-  // a deterministic value is required so the same backtest always gives the same result.
-  const extraPct = 0.125;
-  const slDistance = baseRisk * (1 + extraPct);
-  const tpDistance = baseRisk * rr * (1 - 0.01);
-  return side === 'BUY'
-    ? { sl: entry - slDistance, tp: entry + tpDistance }
-    : { sl: entry + slDistance, tp: entry - tpDistance };
+
+  const lows = tail
+    .map((c) => Number(c.low))
+    .filter((v) => Number.isFinite(v));
+
+  const highs = tail
+    .map((c) => Number(c.high))
+    .filter((v) => Number.isFinite(v));
+
+  if (lows.length === 0 || highs.length === 0) {
+    return null;
+  }
+
+  // =========================
+  // BUY
+  // =========================
+  if (side === 'BUY') {
+    const sl = Math.min(...lows);
+
+    const risk = entry - sl;
+
+    if (risk <= 0) {
+      return null;
+    }
+
+    const tp = entry + risk * rr;
+
+    return {
+      sl,
+      tp,
+    };
+  }
+
+  // =========================
+  // SELL
+  // =========================
+  if (side === 'SELL') {
+    const sl = Math.max(...highs);
+
+    const risk = sl - entry;
+
+    if (risk <= 0) {
+      return null;
+    }
+
+    const tp = entry - risk * rr;
+
+    return {
+      sl,
+      tp,
+    };
+  }
+
+  return null;
 }
 
 function favorableMove(side: 'BUY'|'SELL', from: number, to: number) {
@@ -295,33 +1276,49 @@ function hypotheticalBlockedOutcome(
   entry: number,
 ): 'WIN' | 'LOSS' | 'UNKNOWN' {
   // A blocked signal is evaluated counterfactually using the same deterministic
-  // SL/TP model as the real backtest. This answers whether the blocked
-  // signal would have produced a good or bad outcome.
+  // SL/TP model as the real backtest.
   const sltp = calculateSlTp(candles, start, side, entry);
+
+  if (!sltp) {
+    return 'UNKNOWN';
+  }
 
   for (let j = start + 1; j < Math.min(candles.length, start + 31); j++) {
     const c = candles[j];
     const low = Number(c.low);
     const high = Number(c.high);
-    const slHit = side === 'BUY' ? low <= sltp.sl : high >= sltp.sl;
-    const tpHit = side === 'BUY' ? high >= sltp.tp : low <= sltp.tp;
 
-    // Same conservative rule as the real engine: if both are touched on the
-    // same M1 candle, assume SL happened first.
+    const slHit =
+      side === 'BUY'
+        ? low <= sltp.sl
+        : high >= sltp.sl;
+
+    const tpHit =
+      side === 'BUY'
+        ? high >= sltp.tp
+        : low <= sltp.tp;
+
+    // Same conservative rule as the real engine:
+    // if both are touched on the same M1 candle, assume SL happened first.
     if (slHit && tpHit) return 'LOSS';
     if (slHit) return 'LOSS';
     if (tpHit) return 'WIN';
 
-    // The live/backtest engine also closes an open trade on an opposite MA
-    // cross when no SL/TP/AI exit happened first.
+    // Close on opposite MA cross when no SL/TP exit happened first.
     const cross = crossByIndex.get(j);
+
     if (cross) {
-      const crossSide: 'BUY' | 'SELL' = cross.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
+      const crossSide: 'BUY' | 'SELL' =
+        cross.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
+
       if (crossSide !== side) {
         const exit = Number(cross.price);
-        const pnlMove = (exit - entry) * (side === 'BUY' ? 1 : -1);
+        const pnlMove =
+          (exit - entry) * (side === 'BUY' ? 1 : -1);
+
         if (pnlMove > 0) return 'WIN';
         if (pnlMove < 0) return 'LOSS';
+
         return 'UNKNOWN';
       }
     }
@@ -713,7 +1710,14 @@ export default function Backtest() {
 
       // 4. AI Profit Exit is fully independent of BE/Trailing.
       if (aiProfitExit) {
-        const ai = aiProfitExitDecision(candles, i, open.side, open.entryPrice, currentPrice, open.initialTp, 7);
+        const ai = aiProfitExitDecision(
+                    candles,
+                    i,
+                    open.side,
+                    open.entryPrice,
+                    currentPrice,
+                    open.initialTp
+                  );
         if (ai.score > 0) {
           aiScoreTotal += ai.score;
           aiScoreSamples++;
