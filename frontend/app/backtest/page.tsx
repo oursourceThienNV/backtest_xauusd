@@ -1749,7 +1749,18 @@ export default function Backtest() {
           : Number(c.high) >= pendingLimit.price;
 
         if (filled) {
-          const sltp = calculateSlTp(candles, i, pendingLimit.side, pendingLimit.price);
+          const sltp = calculateSlTp(
+              candles,
+              i,
+              pendingLimit.side,
+              pendingLimit.price
+            );
+
+            if (!sltp) {
+              pendingLimit = null;
+              continue;
+            }
+
           if (sltp.sl != null && sltp.tp != null) {
             open = {
               id: tradeId++,
@@ -1889,20 +1900,25 @@ export default function Backtest() {
       }
 
       const sltp = calculateSlTp(candles, i, side, finalEntry);
-      open = {
-        id: tradeId++,
-        side,
-        entryTime: Number(c.time),
-        entryPrice: finalEntry,
-        lot: resolveLot(lossStreak),
-        crossPrice: entry,
-        sl: sltp.sl,
-        tp: sltp.tp,
-        initialTp: sltp.tp,
-        beApplied: false,
-        trailingApplied: false,
-        entryType: 'MARKET',
-      };
+
+          if (!sltp) {
+            continue;
+          }
+
+          open = {
+            id: tradeId++,
+            side,
+            entryTime: Number(c.time),
+            entryPrice: finalEntry,
+            lot: resolveLot(lossStreak),
+            crossPrice: entry,
+            sl: sltp.sl,
+            tp: sltp.tp,
+            initialTp: sltp.tp,
+            beApplied: false,
+            trailingApplied: false,
+            entryType: 'MARKET',
+          };
       acceptedSignals++;
       marketEntries++;
     }
