@@ -4,13 +4,17 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import MarketChart from '../../components/MarketChart';
 import { api } from '../../lib/api';
+import DatePicker from 'react-datepicker';
+import 'react-datepicker/dist/react-datepicker.css';
 
 type Trade = {
   id: number;
   side: 'BUY' | 'SELL';
   entryTime: number;
+  entryCandleTime: string;
   entryPrice: number;
   exitTime: number;
+  exitCandleTime: string;
   exitPrice: number;
   lot: number;
   pnl: number;
@@ -108,8 +112,8 @@ function detectCrosses(candles: any[]) {
   const crosses: any[] = [];
   for (let i = 1; i < candles.length; i++) {
     const p = candles[i - 1], c = candles[i];
-    if (Number(p.ema_fast) < Number(p.ema_slow) && Number(c.ema_fast) > Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), price: Number(c.close), type: 'BUY_CROSS' });
-    if (Number(p.ema_fast) > Number(p.ema_slow) && Number(c.ema_fast) < Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), price: Number(c.close), type: 'SELL_CROSS' });
+    if (Number(p.ema_fast) < Number(p.ema_slow) && Number(c.ema_fast) > Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close), type: 'BUY_CROSS' });
+    if (Number(p.ema_fast) > Number(p.ema_slow) && Number(c.ema_fast) < Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close), type: 'SELL_CROSS' });
   }
   return crosses;
 }
@@ -120,7 +124,7 @@ function fomoTh1(candles: any[], i: number) {
   const body = Math.abs(Number(c.close) - Number(c.open));
   const avg = candles.slice(i - 20, i).reduce((s, x) => s + Math.abs(Number(x.close) - Number(x.open)), 0) / 20;
   const range = Number(c.high) - Number(c.low);
-  return avg > 0 && body > avg * 1.8 && range > 0 && body / range > 0.65;
+  return avg > 0 && body > avg * 1.6 && range > 0 && body / range > 0.6;
 }
 
 function fomoTh2(candles: any[], i: number, crossPrice: number, side: 'BUY'|'SELL') {
@@ -130,18 +134,18 @@ function fomoTh2(candles: any[], i: number, crossPrice: number, side: 'BUY'|'SEL
   const avgLow = cs.reduce((s,c)=>s+Number(c.low),0)/3;
   const avgRange = Math.abs(avgHigh-avgLow);
   const distance = side === 'BUY' ? Math.abs(crossPrice-Math.min(...cs.map(c=>Number(c.low)))) : Math.abs(crossPrice-Math.max(...cs.map(c=>Number(c.high))));
-  return distance > 0 && avgRange < distance * 4;
+  return distance > 0 && avgRange < distance * 2;
 }
 
-function fomoTh3(candles: any[], i: number, side: 'BUY'|'SELL') {
-  if (i < 2) return { pass:false, decision:null, limitPrice:null };
-  const cs = [candles[i-2], candles[i-1], candles[i]];
-  const colors = cs.map(candleColor);
-  if (colors.includes('DOJI')) return { pass:false, decision:null, limitPrice:null };
-  const needed = side === 'BUY' ? 'GREEN' : 'RED';
-  const pass = colors.every(c => c === needed);
-  return { pass, decision: pass ? `${side}_LIMIT` : null, limitPrice: pass ? (Number(candles[i-1].high)+Number(candles[i-1].low))/2 : null };
-}
+// function fomoTh3(candles: any[], i: number, side: 'BUY'|'SELL') {
+//   if (i < 2) return { pass:false, decision:null, limitPrice:null };
+//   const cs = [candles[i-2], candles[i-1], candles[i]];
+//   const colors = cs.map(candleColor);
+//   if (colors.includes('DOJI')) return { pass:false, decision:null, limitPrice:null };
+//   const needed = side === 'BUY' ? 'GREEN' : 'RED';
+//   const pass = colors.every(c => c === needed);
+//   return { pass, decision: pass ? `${side}_LIMIT` : null, limitPrice: pass ? (Number(candles[i-1].high)+Number(candles[i-1].low))/2 : null };
+// }
 
 function atrValue(candles: any[], index: number, period = 14) {
   if (index < 1) return 0;
@@ -1328,13 +1332,30 @@ function hypotheticalBlockedOutcome(
 }
 
 
-const fmt = (ts: number) =>
-  new Date(ts * 1000).toLocaleString('vi-VN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    day: '2-digit',
-    month: '2-digit',
-  });
+// Hiển thị trực tiếp candle_time từ DB; tuyệt đối không chuyển qua Date/múi giờ.
+const fmt = (candleTime?: string | null) => {
+  if (!candleTime) return '—';
+  const match = String(candleTime).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return String(candleTime);
+  const [, yyyy, mm, dd, hh, mi, ss = '00'] = match;
+  return `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
+};
+
+const parseCandleTime = (candleTime: string) => {
+  const match = String(candleTime ?? '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return null;
+  return {
+    year: Number(match[1]), month: Number(match[2]), day: Number(match[3]),
+    hour: Number(match[4]), minute: Number(match[5]), second: Number(match[6] ?? 0),
+  };
+};
+
+const candleWeekday = (candleTime: string) => {
+  const parts = parseCandleTime(candleTime);
+  if (!parts) return -1;
+  // UTC chỉ dùng để tính thứ trên các thành phần lịch đã đọc trực tiếp từ candle_time.
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
+};
 
 const parseLotChain = (value: string) =>
   value
@@ -1345,8 +1366,8 @@ const parseLotChain = (value: string) =>
 export default function Backtest() {
   const router = useRouter();
 
-  const [from, setFrom] = useState('2026-09-01T00:00');
-  const [to, setTo] = useState('2026-09-30T23:59');
+  const [from, setFrom] = useState('2026-09-01');
+  const [to, setTo] = useState('2026-09-30');
 
   const [fast, setFast] = useState(9);
   const [slow, setSlow] = useState(21);
@@ -1424,11 +1445,12 @@ export default function Backtest() {
   const winRate = trades.length ? (wins / trades.length) * 100 : 0;
   const totalPnl = trades.reduce((sum, x) => sum + x.pnl, 0);
 
-  function isWithinTradingSession(ts: number) {
+  function isWithinTradingSession(candleTime: string) {
     if (!useTradingSession) return true;
 
-    const d = new Date(ts * 1000);
-    const minutes = d.getHours() * 60 + d.getMinutes();
+    const parts = parseCandleTime(candleTime);
+    if (!parts) return false;
+    const minutes = parts.hour * 60 + parts.minute;
     const [fh, fm] = sessionFrom.split(':').map(Number);
     const [th, tm] = sessionTo.split(':').map(Number);
     const fromMinutes = fh * 60 + fm;
@@ -1441,10 +1463,10 @@ export default function Backtest() {
     return minutes >= fromMinutes || minutes <= toMinutes;
   }
 
-  function isFridayLocked(ts: number) {
+  function isFridayLocked(candleTime: string) {
     if (!fridayLock) return false;
-    const d = new Date(ts * 1000);
-    return d.getDay() === 5 && d.getHours() >= 20;
+    const parts = parseCandleTime(candleTime);
+    return !!parts && candleWeekday(candleTime) === 5 && parts.hour >= 20;
   }
 
   function resolveLot(lossStreak: number) {
@@ -1551,10 +1573,11 @@ export default function Backtest() {
     const fridayLock = runCfg.fridayLock; const useLotChain = runCfg.useLotChain; const lotChain = runCfg.lotChain;
     const baseLot = runCfg.baseLot; const useTradingSession = runCfg.useTradingSession;
     const sessionFrom = runCfg.sessionFrom; const sessionTo = runCfg.sessionTo;
-    const isWithinTradingSession = (ts: number) => {
+    const isWithinTradingSession = (candleTime: string) => {
       if (!useTradingSession) return true;
-      const d = new Date(ts * 1000);
-      const minutes = d.getHours() * 60 + d.getMinutes();
+      const parts = parseCandleTime(candleTime);
+      if (!parts) return false;
+      const minutes = parts.hour * 60 + parts.minute;
       const [fh, fm] = sessionFrom.split(':').map(Number);
       const [th, tm] = sessionTo.split(':').map(Number);
       const fromMinutes = fh * 60 + fm;
@@ -1563,10 +1586,10 @@ export default function Backtest() {
         ? minutes >= fromMinutes && minutes <= toMinutes
         : minutes >= fromMinutes || minutes <= toMinutes;
     };
-    const isFridayLocked = (ts: number) => {
+    const isFridayLocked = (candleTime: string) => {
       if (!fridayLock) return false;
-      const d = new Date(ts * 1000);
-      return d.getDay() === 5 && d.getHours() >= 20;
+      const parts = parseCandleTime(candleTime);
+      return !!parts && candleWeekday(candleTime) === 5 && parts.hour >= 20;
     };
     const resolveLot = (lossStreak: number) => {
       if (!useLotChain) return baseLot;
@@ -1627,7 +1650,7 @@ export default function Backtest() {
       else stat.unknown++;
     };
 
-    const closeTrade = (exitTime: number, exitPrice: number, reason: string) => {
+    const closeTrade = (exitTime: number, exitCandleTime: string, exitPrice: number, reason: string) => {
       if (!open) return;
       const direction = open.side === 'BUY' ? 1 : -1;
       const pnl = Number(((exitPrice - open.entryPrice) * direction * open.lot * 100).toFixed(2));
@@ -1636,7 +1659,8 @@ export default function Backtest() {
       updateDrawdown();
       if (pnl > 0) grossWin += pnl;
       if (pnl < 0) grossLoss += Math.abs(pnl);
-      const hour = new Date(open.entryTime * 1000).getHours();
+      const entryParts = parseCandleTime(open.entryCandleTime);
+      const hour = entryParts?.hour ?? 0;
       hourStats[hour].trades++;
       hourStats[hour].pnl += pnl;
       if (pnl > 0) hourStats[hour].wins++;
@@ -1644,8 +1668,10 @@ export default function Backtest() {
         id: open.id,
         side: open.side,
         entryTime: open.entryTime,
+        entryCandleTime: open.entryCandleTime,
         entryPrice: open.entryPrice,
         exitTime,
+        exitCandleTime,
         exitPrice,
         lot: open.lot,
         pnl,
@@ -1666,15 +1692,15 @@ export default function Backtest() {
       const slHit = open.side === 'BUY' ? low <= open.sl : high >= open.sl;
       const tpHit = open.side === 'BUY' ? high >= open.tp : low <= open.tp;
       if (slHit && tpHit) {
-        closeTrade(Number(c.time), open.sl, 'SL/TP same candle · conservative SL');
+        closeTrade(Number(c.time), String(c.candle_time), open.sl, 'SL/TP same candle · conservative SL');
         return true;
       }
       if (slHit) {
-        closeTrade(Number(c.time), open.sl, 'Stop Loss');
+        closeTrade(Number(c.time), String(c.candle_time), open.sl, 'Stop Loss');
         return true;
       }
       if (tpHit) {
-        closeTrade(Number(c.time), open.tp, 'Take Profit');
+        closeTrade(Number(c.time), String(c.candle_time), open.tp, 'Take Profit');
         return true;
       }
 
@@ -1704,7 +1730,7 @@ export default function Backtest() {
       // that was moved before the close, without pretending we have tick data.
       const movedSlHit = open.side === 'BUY' ? low <= open.sl : high >= open.sl;
       if (movedSlHit) {
-        closeTrade(Number(c.time), open.sl, open.trailingApplied ? 'Trailing Stop' : 'Break Even');
+        closeTrade(Number(c.time), String(c.candle_time), open.sl, open.trailingApplied ? 'Trailing Stop' : 'Break Even');
         return true;
       }
 
@@ -1727,7 +1753,7 @@ export default function Backtest() {
         if (ai.action === 'CLOSE') {
           aiExitStat.closes++;
           aiProfitTotal += Math.max(0, favorableMove(open.side, open.entryPrice, currentPrice) * open.lot * 100);
-          closeTrade(Number(c.time), currentPrice, `AI Profit Exit · Score ${ai.score.toFixed(1)} · ${ai.reasons.slice(0, 2).join(', ') || 'adaptive reversal'}`);
+          closeTrade(Number(c.time), String(c.candle_time), currentPrice, `AI Profit Exit · Score ${ai.score.toFixed(1)} · ${ai.reasons.slice(0, 2).join(', ') || 'adaptive reversal'}`);
           return true;
         }
       }
@@ -1766,6 +1792,7 @@ export default function Backtest() {
               id: tradeId++,
               side: pendingLimit.side,
               entryTime: Number(c.time),
+              entryCandleTime: String(c.candle_time),
               entryPrice: pendingLimit.price,
               lot: resolveLot(lossStreak),
               crossPrice: pendingLimit.crossPrice,
@@ -1815,12 +1842,12 @@ export default function Backtest() {
       if (useTradingSession) session.checks++;
       if (fridayLock) friday.checks++;
 
-      if (!isWithinTradingSession(Number(c.time))) {
+      if (!isWithinTradingSession(String(c.candle_time))) {
         recordBlockedSignal(session, i, side, entry);
         noTrade++;
         continue;
       }
-      if (isFridayLocked(Number(c.time))) {
+      if (isFridayLocked(String(c.candle_time))) {
         recordBlockedSignal(friday, i, side, entry);
         noTrade++;
         continue;
@@ -1850,29 +1877,21 @@ export default function Backtest() {
         }
       }
 
-      let decision: 'MARKET' | 'BUY_LIMIT' | 'SELL_LIMIT' = 'MARKET';
-      let finalEntry = entry;
+      const finalEntry = entry;
 
       if (antiFomo) {
         fomo.checks++;
+
         const th1 = fomoTh1(candles, i);
         const th2 = fomoTh2(candles, i, entry, side);
 
-        // Exact source flow: TH1 + TH2 => MARKET; otherwise TH3.
-        if (th1 && th2) {
-          decision = 'MARKET';
-        } else {
-          const th3 = fomoTh3(candles, i, side);
-          if (!th3.pass || th3.limitPrice == null) {
-            recordBlockedSignal(fomo, i, side, entry);
-            noTrade++;
-            continue;
-          }
-          decision = th3.decision as 'BUY_LIMIT' | 'SELL_LIMIT';
-          finalEntry = Number(th3.limitPrice);
+        // TH1 + TH2 => MARKET; otherwise BLOCK.
+        if (!(th1 && th2)) {
+          recordBlockedSignal(fomo, i, side, entry);
+          noTrade++;
+          continue;
         }
       }
-
       // THIS is the replace/cancel rule:
       // only now, after a real NEW strategy signal has been accepted, remove
       // the previous pending LIMIT. The new signal can then be MARKET or a new
@@ -1883,22 +1902,9 @@ export default function Backtest() {
 
       // A valid opposite market/limit signal closes an existing position.
       if (open && open.side !== side) {
-        closeTrade(Number(c.time), entry, 'Opposite MA Cross');
+        closeTrade(Number(c.time), String(c.candle_time), entry, 'Opposite MA Cross');
       }
       if (open) continue;
-
-      if (decision === 'BUY_LIMIT' || decision === 'SELL_LIMIT') {
-        pendingLimit = {
-          side,
-          price: finalEntry,
-          crossPrice: entry,
-          crossTime: Number(c.time),
-          decision,
-        };
-        // The pending order is not counted until it actually fills.
-        continue;
-      }
-
       const sltp = calculateSlTp(candles, i, side, finalEntry);
 
           if (!sltp) {
@@ -1909,6 +1915,7 @@ export default function Backtest() {
             id: tradeId++,
             side,
             entryTime: Number(c.time),
+            entryCandleTime: String(c.candle_time),
             entryPrice: finalEntry,
             lot: resolveLot(lossStreak),
             crossPrice: entry,
@@ -1925,7 +1932,7 @@ export default function Backtest() {
 
     if (open) {
       const last = candles[candles.length - 1];
-      closeTrade(Number(last.time), Number(last.close), 'End of Backtest');
+      closeTrade(Number(last.time), String(last.candle_time), Number(last.close), 'End of Backtest');
     }
 
     const wins = result.filter(x => x.result === 'WIN').length;
@@ -2011,52 +2018,75 @@ export default function Backtest() {
     setData((d:any) => ({ ...d, candles, crosses, lastBacktestConfig: currentConfigText }));
   }
 
-  async function start() {
-    setError('');
-    setPlaying(false);
-    setBotRunning(true);
-    setTrades([]);
-    setBotBalance(initialBalance);
+  
+async function start() {
+  setError('');
 
-    if (useLotChain && lotChain.length === 0) {
-      setError('Chuỗi lot không hợp lệ.');
-      return;
-    }
-
-    try {
-      const d = await api('/api/replay/prepare', {
-        method: 'POST',
-        body: JSON.stringify({
-          symbol: 'XAUUSD',
-          timeframe: 'M1',
-          from_time: new Date(from).toISOString(),
-          to_time: new Date(to).toISOString(),
-          ma_fast: fast,
-          ma_slow: slow,
-          ema_trend: trend,
-          ma_trend: maTrendEnabled,
-          sideway_filter: sidewayFilter,
-          anti_fomo: antiFomo,
-          be: breakEven,
-          trailing,
-          ai_profit_exit: aiProfitExit,
-          friday_lock: fridayLock,
-          multi_lot: useLotChain,
-          lot_chain: lotChain,
-          lot: baseLot,
-          auto_session: useTradingSession,
-          sessions: useTradingSession
-            ? [{ from: sessionFrom, to: sessionTo }]
-            : [],
-        }),
-      });
-
-      setData(d);
-      setVisible(Math.min(Math.max(fast, slow, trend) + 5, d.candles.length));
-    } catch (e: any) {
-      setError(e?.message || 'Không thể khởi động replay');
-    }
+  // Kiểm tra trước khi bật trạng thái đang chạy
+  if (useLotChain && lotChain.length === 0) {
+    setError('Chuỗi lot không hợp lệ.');
+    return;
   }
+
+  setPlaying(false);
+  setBotRunning(true);
+  setTrades([]);
+  setBotBalance(initialBalance);
+
+  try {
+    console.log('[REPLAY] Starting...', { from, to });
+
+    const d = await api('/api/replay/prepare', {
+      method: 'POST',
+      body: JSON.stringify({
+        symbol: 'XAUUSD',
+        timeframe: 'M1',
+        from_time: `${from} 00:00:00`,
+        to_time: `${to} 23:59:00`,
+        ma_fast: fast,
+        ma_slow: slow,
+        ema_trend: trend,
+        ma_trend: maTrendEnabled,
+        sideway_filter: sidewayFilter,
+        anti_fomo: antiFomo,
+        be: breakEven,
+        trailing,
+        ai_profit_exit: aiProfitExit,
+        friday_lock: fridayLock,
+        multi_lot: useLotChain,
+        lot_chain: lotChain,
+        lot: baseLot,
+        auto_session: useTradingSession,
+        sessions: useTradingSession
+          ? [{ from: sessionFrom, to: sessionTo }]
+          : [],
+      }),
+    });
+
+    console.log('[REPLAY] Response:', d);
+
+    if (!d?.candles?.length) {
+      throw new Error('API không trả về dữ liệu nến.');
+    }
+
+    setData(d);
+    setVisible(
+      Math.min(
+        Math.max(fast, slow, trend) + 5,
+        d.candles.length
+      )
+    );
+
+    console.log('[REPLAY] Loaded candles:', d.candles.length);
+  } catch (e: any) {
+    console.error('[REPLAY] Error:', e);
+    setError(e?.message || 'Không thể khởi động replay');
+  } finally {
+    // Luôn trả trạng thái về bình thường, kể cả khi API lỗi
+    setBotRunning(false);
+  }
+}
+
 
   function logout() {
     localStorage.removeItem('access_token');
@@ -2260,14 +2290,39 @@ export default function Backtest() {
           <div className="section-title space">PERIOD</div>
 
           <label>
-            From
-            <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} />
-          </label>
+  From
+  <DatePicker
+    selected={from ? new Date(`${from}T00:00:00`) : null}
+    onChange={(date: Date | null) => {
+      if (date) {
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        setFrom(`${y}-${m}-${d}`);
+      }
+    }}
+    dateFormat="dd/MM/yyyy"
+    placeholderText="dd/mm/yyyy"
+  />
+</label>
 
-          <label>
-            To
-            <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} />
-          </label>
+<label>
+  To
+  <DatePicker
+    selected={to ? new Date(`${to}T00:00:00`) : null}
+    onChange={(date: Date | null) => {
+      if (date) {
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        setTo(`${y}-${m}-${d}`);
+      }
+    }}
+    dateFormat="dd/MM/yyyy"
+    minDate={from ? new Date(`${from}T00:00:00`) : undefined}
+    placeholderText="dd/mm/yyyy"
+  />
+</label>
 
           <button className="primary wide" onClick={start}>START REPLAY</button>
 
@@ -2297,7 +2352,7 @@ export default function Backtest() {
             <div className="chart-head">
               <div>
                 <strong>XAUUSD · M1</strong>
-                <span>{candle ? fmt(candle.time) : 'Ready for replay'}</span>
+                <span>{candle ? fmt(candle.candle_time) : 'Ready for replay'}</span>
               </div>
 
               <div className="controls">
@@ -2343,7 +2398,7 @@ export default function Backtest() {
               {data?.crosses?.slice(-6).reverse().map((x: any) => (
                 <div className="event" key={x.index}>
                   <span className={x.type === 'BUY_CROSS' ? 'buy' : 'sell'}>{x.type === 'BUY_CROSS' ? 'BUY' : 'SELL'}</span>
-                  <span>{fmt(x.time)}</span>
+                  <span>{fmt(x.candle_time || data?.candles?.find((item: any) => Number(item.time) === Number(x.time))?.candle_time)}</span>
                   <b>{Number(x.price).toFixed(2)}</b>
                   <small>{x.trend}</small>
                 </div>
@@ -2499,9 +2554,9 @@ export default function Backtest() {
                     <tr key={trade.id}>
                       <td>{trade.id}</td>
                       <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
-                      <td>{fmt(trade.entryTime)}</td>
+                      <td>{fmt(trade.entryCandleTime)}</td>
                       <td>{trade.entryPrice.toFixed(2)}</td>
-                      <td>{fmt(trade.exitTime)}</td>
+                      <td>{fmt(trade.exitCandleTime)}</td>
                       <td>{trade.exitPrice.toFixed(2)}</td>
                       <td>{trade.lot.toFixed(2)}</td>
                       <td className={trade.pnl >= 0 ? 'up' : 'down'}>{trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}</td>

@@ -3,13 +3,14 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-
+from datetime import datetime, timedelta
 from .config import settings
 from .db import Base, engine, get_db
 from .models import User, BacktestSession
 from .schemas import LoginRequest, LoginResponse, ReplayRequest
 from .security import hash_password, verify_password, create_token, get_current_user
 from .indicators import build_crosses
+import calendar
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -69,7 +70,7 @@ def prepare_replay(
 
     sql = text("""
         SELECT
-            UNIX_TIMESTAMP(candle_time) AS time,
+            candle_time,
             open_price AS open,
             high_price AS high,
             low_price AS low,
@@ -77,19 +78,46 @@ def prepare_replay(
             tick_volume AS volume
         FROM xauusd_m1
         WHERE symbol LIKE :symbol_prefix
-          AND timeframe = :tf
-          AND candle_time BETWEEN :from_time AND :to_time
+        AND timeframe = :tf
+        AND candle_time >= :from_time
+        AND candle_time < :end_time_exclusive
         ORDER BY candle_time ASC
     """)
+
+    end_time_exclusive = body.to_time.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) + timedelta(days=1)
 
     rows = db.execute(sql, {
         "symbol_prefix": f"{body.symbol}%",
         "tf": body.timeframe,
         "from_time": body.from_time,
-        "to_time": body.to_time,
+        "end_time_exclusive": end_time_exclusive,
     }).mappings().all()
+    print("TOTAL ROWS:", len(rows))
+    if rows:
+        print("FIRST ROW:", dict(rows[0]))
+        print("LAST ROW:", dict(rows[-1]))
 
-    candles = [dict(row) for row in rows]
+    candles = []
+
+    for row in rows:
+        candle = dict(row)
+
+        # Giữ nguyên thời gian đọc từ DB để đối chiếu
+        db_time = candle["candle_time"]
+
+        # Chuyển các thành phần giờ trong DB thành timestamp giây
+        # theo quy ước UTC để biểu đồ hiển thị đúng giờ DB.
+        candle["time"] = calendar.timegm(db_time.timetuple())
+
+        # Trả thêm chuỗi thời gian gốc cho frontend
+        candle["candle_time"] = db_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        candles.append(candle)
     if not candles:
         raise HTTPException(404, "No XAUUSD M1 data found for selected period")
 
