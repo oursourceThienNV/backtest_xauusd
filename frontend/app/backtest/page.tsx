@@ -33,7 +33,8 @@ type FilterStat = {
 
 type RunConfig = {
   fast: number; slow: number; trend: number; maTrendEnabled: boolean;
-  sidewayFilter: boolean; antiFomo: boolean; breakEven: boolean; trailing: boolean;
+  sideway1Filter: boolean;
+  sideway2Filter: boolean; antiFomo: boolean; breakEven: boolean; trailing: boolean;
   aiProfitExit: boolean; fridayLock: boolean; useLotChain: boolean;
   lotChain: number[]; baseLot: number; useTradingSession: boolean;
   sessionFrom: string; sessionTo: string;
@@ -1376,7 +1377,11 @@ export default function Backtest() {
   const [speed, setSpeed] = useState(1);
 
   // Filters - match Trend UI config names.
-  const [sidewayFilter, setSidewayFilter] = useState(true);
+  // Sideway 1: lọc vùng giá ±3 USD
+const [sideway1Filter, setSideway1Filter] = useState(true);
+
+// Sideway 2: lọc Candle Power
+const [sideway2Filter, setSideway2Filter] = useState(true);
   const [antiFomo, setAntiFomo] = useState(true);
 
   // Position management.
@@ -1484,17 +1489,32 @@ export default function Backtest() {
    * There is deliberately NO optimizer and NO automatic config mutation here.
    */
   function getCurrentConfig(): RunConfig {
-    return {
-      fast, slow, trend, maTrendEnabled, sidewayFilter, antiFomo, breakEven, trailing,
-      aiProfitExit, fridayLock, useLotChain, lotChain: [...lotChain], baseLot,
-      useTradingSession, sessionFrom, sessionTo,
-    };
+   return {
+  fast,
+  slow,
+  trend,
+  maTrendEnabled,
+  sideway1Filter,
+  sideway2Filter,
+  antiFomo,
+  breakEven,
+  trailing,
+  aiProfitExit,
+  fridayLock,
+  useLotChain,
+  lotChain: [...lotChain],
+  baseLot,
+  useTradingSession,
+  sessionFrom,
+  sessionTo,
+};
   }
 
   function configLabel(c: RunConfig) {
     return [
       `MA ${c.fast}/${c.slow}`, `Trend ${c.trend} ${c.maTrendEnabled ? 'ON' : 'OFF'}`,
-      c.sidewayFilter ? 'Sideway ON' : 'Sideway OFF', c.antiFomo ? 'FOMO ON' : 'FOMO OFF',
+      c.sideway1Filter ? 'Sideway 1 ON' : 'Sideway 1 OFF',
+c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'FOMO OFF',
       c.breakEven ? 'BE ON' : 'BE OFF', c.trailing ? 'Trailing ON' : 'Trailing OFF',
       c.aiProfitExit ? 'AI Exit ON' : 'AI Exit OFF', c.fridayLock ? 'Friday ON' : 'Friday OFF',
       c.useTradingSession ? `Session ${c.sessionFrom}-${c.sessionTo}` : 'Session OFF',
@@ -1511,7 +1531,10 @@ export default function Backtest() {
 
     if (result.length === 0) {
       if (cfg.antiFomo) add('fomo-off', 'Thử tắt Anti FOMO', 'Lần chạy hiện tại không có lệnh hoàn tất và Anti FOMO có thể đang loại quá nhiều tín hiệu.', 'Kiểm tra xem số lệnh có tăng mà chất lượng vẫn giữ được hay không.', { antiFomo: false });
-      if (cfg.sidewayFilter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', { sidewayFilter: false });
+      if (cfg.sideway1Filter || cfg.sideway2Filter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', {
+  sideway1Filter: false,
+  sideway2Filter: false,
+});
     } else {
       const fomoPrecision = stats.fomo.blocked > 0 ? stats.fomo.correct / stats.fomo.blocked * 100 : null;
       const sidewayPrecision = stats.sideway.blocked > 0 ? stats.sideway.correct / stats.sideway.blocked * 100 : null;
@@ -1523,9 +1546,15 @@ export default function Backtest() {
       }
 
       if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision < 55) {
-        add('sideway-off', 'Thử Sideway = OFF', `Sideway BLOCK ${stats.sideway.blocked}/${stats.sideway.checks}, nhưng hiệu quả chặn chỉ ${sidewayPrecision.toFixed(1)}% (đúng ${stats.sideway.correct}, sai ${stats.sideway.wrong}).`, 'Kiểm tra xem Sideway có đang bỏ lỡ quá nhiều lệnh tốt sau loss streak hay không.', { sidewayFilter: false });
+        add('sideway-off', 'Thử Sideway = OFF', `Sideway BLOCK ${stats.sideway.blocked}/${stats.sideway.checks}, nhưng hiệu quả chặn chỉ ${sidewayPrecision.toFixed(1)}% (đúng ${stats.sideway.correct}, sai ${stats.sideway.wrong}).`, 'Kiểm tra xem Sideway có đang bỏ lỡ quá nhiều lệnh tốt sau loss streak hay không.', {
+  sideway1Filter: false,
+  sideway2Filter: false,
+});
       } else if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision >= 70) {
-        add('sideway-keep', 'Giữ Sideway để kiểm chứng thêm', `Sideway BLOCK ${stats.sideway.blocked} case và hiệu quả chặn ${sidewayPrecision.toFixed(1)}%.`, 'Chạy trên giai đoạn khác để xác nhận filter thực sự có lợi thế.', { sidewayFilter: true });
+        add('sideway-keep', 'Giữ Sideway để kiểm chứng thêm', `Sideway BLOCK ${stats.sideway.blocked} case và hiệu quả chặn ${sidewayPrecision.toFixed(1)}%.`, 'Chạy trên giai đoạn khác để xác nhận filter thực sự có lợi thế.', {
+  sideway1Filter: false,
+  sideway2Filter: false,
+});
       }
       if (cfg.breakEven) {
         const beTrades = result.filter(t => /Break Even/i.test(t.reason));
@@ -1568,7 +1597,10 @@ export default function Backtest() {
   async function runBot(overrides?: RunConfig) {
     const runCfg = overrides || getCurrentConfig();
     const fast = runCfg.fast; const slow = runCfg.slow; const trend = runCfg.trend;
-    const maTrendEnabled = runCfg.maTrendEnabled; const sidewayFilter = runCfg.sidewayFilter; const antiFomo = runCfg.antiFomo;
+    const maTrendEnabled = runCfg.maTrendEnabled;
+const sideway1Filter = runCfg.sideway1Filter;
+const sideway2Filter = runCfg.sideway2Filter;
+const antiFomo = runCfg.antiFomo;
     const breakEven = runCfg.breakEven; const trailing = runCfg.trailing; const aiProfitExit = runCfg.aiProfitExit;
     const fridayLock = runCfg.fridayLock; const useLotChain = runCfg.useLotChain; const lotChain = runCfg.lotChain;
     const baseLot = runCfg.baseLot; const useTradingSession = runCfg.useTradingSession;
@@ -1857,25 +1889,39 @@ export default function Backtest() {
       // Outside the range + CandlePower >= 1.5 => PASS.
       // Outside the range + CandlePower < 1.5 => WAIT (do not block state).
       // Inside the range => BLOCK and wait for the next MA Cross.
-      if (sidewayFilter && lossStreak >= 1 && lastLossCrossPrice !== null) {
-        sideway.checks++;
-        const lower = lastLossCrossPrice - 3;
-        const upper = lastLossCrossPrice + 3;
-        const cp = bodyPower(candles, i);
-        const outsideRange = entry < lower || entry > upper;
-        const strongCandle = cp >= 1.5;
-        if (outsideRange && strongCandle) {
-          // PASS
-        } else if (outsideRange && !strongCandle) {
-          sideway.waited = (sideway.waited || 0) + 1;
-          noTrade++;
-          continue;
-        } else {
-          recordBlockedSignal(sideway, i, side, entry);
-          noTrade++;
-          continue;
-        }
-      }
+      
+const sidewayEnabled = sideway1Filter || sideway2Filter;
+
+if (
+  sidewayEnabled &&
+  lossStreak >= 1 &&
+  lastLossCrossPrice !== null
+) {
+  sideway.checks++;
+
+  const lower = lastLossCrossPrice - 3;
+  const upper = lastLossCrossPrice + 3;
+  const cp = bodyPower(candles, i);
+
+  const outsideRange = entry < lower || entry > upper;
+
+  // SIDEWAY 1: BLOCK hẳn nếu giá nằm trong vùng ±3 USD.
+  // Ưu tiên BLOCK trước khi kiểm tra Candle Power.
+  if (sideway1Filter && !outsideRange) {
+    recordBlockedSignal(sideway, i, side, entry);
+    noTrade++;
+    continue;
+  }
+
+  // SIDEWAY 2: WAITING nếu Candle Power không vượt ngưỡng.
+  // Không ghi nhận là BLOCK.
+  if (sideway2Filter && cp < 1.5) {
+    sideway.waited = (sideway.waited || 0) + 1;
+    noTrade++;
+    continue;
+  }
+}
+
 
       const finalEntry = entry;
 
@@ -2047,7 +2093,7 @@ async function start() {
         ma_slow: slow,
         ema_trend: trend,
         ma_trend: maTrendEnabled,
-        sideway_filter: sidewayFilter,
+        sideway_filter: sideway1Filter || sideway2Filter,
         anti_fomo: antiFomo,
         be: breakEven,
         trailing,
@@ -2156,14 +2202,33 @@ async function start() {
           <div className="section-title space">FILTERS</div>
 
           <div className="strategy-option">
-            <label className="switch-row">
-              <input type="checkbox" checked={sidewayFilter} onChange={(e) => setSidewayFilter(e.target.checked)} />
-              <span className="switch" />
-              <span className="switch-content">
-                <strong>Sideway Filter</strong>
-                <small>AI lọc thị trường đi ngang</small>
-              </span>
-            </label>
+            
+<label className="switch-row">
+  <input
+    type="checkbox"
+    checked={sideway1Filter}
+    onChange={(e) => setSideway1Filter(e.target.checked)}
+  />
+  <span className="switch" />
+  <span className="switch-content">
+    <strong>Sideway 1 — Price Range ±3</strong>
+    <small>Trong vùng ±3 USD sau lệnh thua thì BLOCK tín hiệu</small>
+  </span>
+</label>
+
+<label className="switch-row">
+  <input
+    type="checkbox"
+    checked={sideway2Filter}
+    onChange={(e) => setSideway2Filter(e.target.checked)}
+  />
+  <span className="switch" />
+  <span className="switch-content">
+    <strong>Sideway 2 — Candle Power</strong>
+    <small>Candle Power ≤ 1.5 thì WAITING, không BLOCK hẳn</small>
+  </span>
+</label>
+
 
             <label className="switch-row">
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
@@ -2388,8 +2453,19 @@ async function start() {
               <div className="market-row"><span>MA Slow</span><b>{candle?.ma_slow?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>EMA {trend}</span><b>{candle?.ema_trend?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>MA Trend Filter</span><b className={maTrendEnabled ? 'up' : ''}>{maTrendEnabled ? 'ON' : 'OFF'}</b></div>
-              <div className="market-row"><span>Sideway</span><b className={sidewayFilter ? 'up' : ''}>{sidewayFilter ? 'ON' : 'OFF'}</b></div>
-              <div className="market-row"><span>Anti FOMO</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
+<div className="market-row">
+  <span>Sideway 1 — Price Range</span>
+  <b className={sideway1Filter ? 'up' : ''}>
+    {sideway1Filter ? 'ON' : 'OFF'}
+  </b>
+</div>
+
+<div className="market-row">
+  <span>Sideway 2 — Candle Power</span>
+  <b className={sideway2Filter ? 'up' : ''}>
+    {sideway2Filter ? 'ON' : 'OFF'}
+  </b>
+</div>              <div className="market-row"><span>Anti FOMO</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
               <div className="market-row"><span>AI Profit Exit</span><b className={aiProfitExit ? 'up' : ''}>{aiProfitExit ? 'ON' : 'OFF'}</b></div>
             </div>
 
@@ -2456,7 +2532,8 @@ async function start() {
                       <div><span>ĐỀ XUẤT #{idx + 1}</span><strong>{r.title}</strong></div>
                       <button className="recommendation-run" disabled={botRunning} onClick={() => {
                         setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(r.config.maTrendEnabled);
-                        setSidewayFilter(r.config.sidewayFilter); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
+                        setSideway1Filter(r.config.sideway1Filter);
+setSideway2Filter(r.config.sideway2Filter); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
                         setAiProfitExit(r.config.aiProfitExit); setFridayLock(r.config.fridayLock); setUseLotChain(r.config.useLotChain);
                         setBaseLot(r.config.baseLot); setUseTradingSession(r.config.useTradingSession); setSessionFrom(r.config.sessionFrom); setSessionTo(r.config.sessionTo);
                         setCustomLotChain(r.config.lotChain.join(', ')); setLotChainMode('custom');
