@@ -28,7 +28,7 @@ type FilterStat = {
   correct: number;
   wrong: number;
   unknown: number;
-  waited?: number;
+  skippedCandlePower?: number;
 };
 
 type RunConfig = {
@@ -70,7 +70,7 @@ type BacktestStats = {
   };
 };
 
-const emptyFilterStat = (): FilterStat => ({ checks: 0, blocked: 0, correct: 0, wrong: 0, unknown: 0, waited: 0 });
+const emptyFilterStat = (): FilterStat => ({ checks: 0, blocked: 0, correct: 0, wrong: 0, unknown: 0, skippedCandlePower: 0 });
 
 const emptyAiExitStat = () => ({ enabled: false, closes: 0, holds: 0, protects: 0, averageScore: 0, averageProfit: 0 });
 const emptySessionAdvisor = () => ({ bestWindow: '—', bestHour: '—', bestPnl: 0, bestWinRate: 0, trades: 0, recommendation: 'Chưa đủ dữ liệu để đưa ra khuyến nghị.' });
@@ -1532,7 +1532,7 @@ c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'F
     if (result.length === 0) {
       if (cfg.antiFomo) add('fomo-off', 'Thử tắt Anti FOMO', 'Lần chạy hiện tại không có lệnh hoàn tất và Anti FOMO có thể đang loại quá nhiều tín hiệu.', 'Kiểm tra xem số lệnh có tăng mà chất lượng vẫn giữ được hay không.', { antiFomo: false });
       if (cfg.sideway1Filter || cfg.sideway2Filter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', {
-  sideway1Filter: false,
+   sideway1Filter: false,
   sideway2Filter: false,
 });
     } else {
@@ -1552,8 +1552,8 @@ c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'F
 });
       } else if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision >= 70) {
         add('sideway-keep', 'Giữ Sideway để kiểm chứng thêm', `Sideway BLOCK ${stats.sideway.blocked} case và hiệu quả chặn ${sidewayPrecision.toFixed(1)}%.`, 'Chạy trên giai đoạn khác để xác nhận filter thực sự có lợi thế.', {
-  sideway1Filter: false,
-  sideway2Filter: false,
+  sideway1Filter: true,
+  sideway2Filter: true,
 });
       }
       if (cfg.breakEven) {
@@ -1885,45 +1885,62 @@ const antiFomo = runCfg.antiFomo;
         continue;
       }
 
-      // Sideway: exact current VPS rule. After a loss, use last loss cross ±3.
-      // Outside the range + CandlePower >= 1.5 => PASS.
-      // Outside the range + CandlePower < 1.5 => WAIT (do not block state).
-      // Inside the range => BLOCK and wait for the next MA Cross.
-      
-const sidewayEnabled = sideway1Filter || sideway2Filter;
+      // Sideway filters are evaluated only after a loss, using the last loss cross ±3.
+      // Sideway 2: if the cross candle already has CP >= 1.4, keep the cross price.
+      // If CP < 1.4, calculate the price level where the candle body would reach 1.4x
+      // its average body, and use that level as Entry only when it lies inside this
+      // candle's High-Low range.
+      const sidewayEnabled = sideway1Filter || sideway2Filter;
+      let finalEntry = entry;
 
-if (
-  sidewayEnabled &&
-  lossStreak >= 1 &&
-  lastLossCrossPrice !== null
-) {
-  sideway.checks++;
+      if (
+        sidewayEnabled &&
+        lossStreak >= 1 &&
+        lastLossCrossPrice !== null
+      ) {
+        sideway.checks++;
 
-  const lower = lastLossCrossPrice - 3;
-  const upper = lastLossCrossPrice + 3;
-  const cp = bodyPower(candles, i);
+        const lower = lastLossCrossPrice - 3;
+        const upper = lastLossCrossPrice + 3;
+        const cp = bodyPower(candles, i);
+        const outsideRange = entry < lower || entry > upper;
 
-  const outsideRange = entry < lower || entry > upper;
+        // SIDEWAY 1: block when the original cross price is inside the ±3 USD zone.
+        if (sideway1Filter && !outsideRange) {
+          recordBlockedSignal(sideway, i, side, entry);
+          noTrade++;
+          continue;
+        }
 
-  // SIDEWAY 1: BLOCK hẳn nếu giá nằm trong vùng ±3 USD.
-  // Ưu tiên BLOCK trước khi kiểm tra Candle Power.
-  if (sideway1Filter && !outsideRange) {
-    recordBlockedSignal(sideway, i, side, entry);
-    noTrade++;
-    continue;
-  }
+        if (sideway2Filter && cp < 1.4) {
+          const candle = candles[i];
+          const high = Number(candle.high);
+          const low = Number(candle.low);
+          const openPrice = Number(candle.open);
+          const avgBody = i >= 20
+            ? candles.slice(i - 20, i).reduce(
+                (sum, previous) => sum + Math.abs(Number(previous.close) - Number(previous.open)),
+                0,
+              ) / 20
+            : 0;
 
-  // SIDEWAY 2: WAITING nếu Candle Power không vượt ngưỡng.
-  // Không ghi nhận là BLOCK.
-  if (sideway2Filter && cp < 1.5) {
-    sideway.waited = (sideway.waited || 0) + 1;
-    noTrade++;
-    continue;
-  }
-}
+          // Price level at which the candle body reaches CP = 1.4.
+          const cpEntry = avgBody > 0
+            ? openPrice + (side === 'BUY' ? 1 : -1) * avgBody * 1.4
+            : Number.NaN;
+          const insideCandleRange = Number.isFinite(cpEntry) && cpEntry >= low && cpEntry <= high;
 
+          // If the CP=1.4 price level is outside this candle's High-Low, reject.
+          // If it is inside the range, use that exact price as the actual Entry.
+          if (!insideCandleRange) {
+            sideway.skippedCandlePower = (sideway.skippedCandlePower || 0) + 1;
+            noTrade++;
+            continue;
+          }
 
-      const finalEntry = entry;
+          finalEntry = cpEntry;
+        }
+      }
 
       if (antiFomo) {
         fomo.checks++;
@@ -2225,7 +2242,7 @@ async function start() {
   <span className="switch" />
   <span className="switch-content">
     <strong>Sideway 2 — Candle Power</strong>
-    <small>Candle Power ≤ 1.5 thì WAITING, không BLOCK hẳn</small>
+    <small>Nếu CP dưới 1.4, lấy mức giá đạt CP 1.4 làm Entry khi nằm trong High–Low của nến; ngoài phạm vi thì loại tín hiệu</small>
   </span>
 </label>
 
@@ -2495,7 +2512,7 @@ async function start() {
                     <b>{blockRate === null ? '—' : `${blockRate.toFixed(1)}%`}</b>
                     <small>Đúng {st.correct} · Sai {st.wrong} · Chưa rõ {st.unknown}</small>
                     {precision !== null && <small>Hiệu quả chặn: {precision.toFixed(1)}%</small>}
-                    {name === 'SIDEWAY' && !!st.waited && <small>WAIT CandlePower: {st.waited}</small>}
+                    {name === 'SIDEWAY' && !!st.skippedCandlePower && <small>Loại tín hiệu: điểm giá đạt CP 1.4 nằm ngoài High–Low của nến: {st.skippedCandlePower}</small>}
                   </div>
                 );
               })}
