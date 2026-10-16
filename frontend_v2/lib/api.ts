@@ -1,0 +1,2 @@
+const API=process.env.NEXT_PUBLIC_API_URL||'http://127.0.0.1:8000';
+export async function api(path:string, options:RequestInit={}){const token=typeof window!=='undefined'?localStorage.getItem('access_token'):null;const headers=new Headers(options.headers);headers.set('Content-Type','application/json');if(token)headers.set('Authorization',`Bearer ${token}`);const r=await fetch(`${API}${path}`,{...options,headers,cache:'no-store'});const data=await r.json().catch(()=>({detail:r.statusText}));if(!r.ok)throw new Error(data.detail||'API request failed');return data}
