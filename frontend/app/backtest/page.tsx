@@ -86,26 +86,17 @@ const candleColor = (c: any) => Number(c.close) > Number(c.open) ? 'GREEN' : Num
 
 function calcIndicators(candles: any[], fast: number, slow: number, trend: number) {
   const out = candles.map((c) => ({ ...c }));
-  // Match pandas Series.ewm(span=period).mean() from the VPS engine (adjust=True).
+  // Match decision_engine: pandas close.ewm(span=period, adjust=False).mean().
   const ema = (period: number) => {
     const alpha = 2 / (period + 1);
-    const decay = 1 - alpha;
-    let weighted = 0;
-    let weightSum = 0;
+    let value: number | null = null;
     return out.map((c) => {
       const close = Number(c.close);
-      weighted = close + decay * weighted;
-      weightSum = 1 + decay * weightSum;
-      return weightSum > 0 ? weighted / weightSum : close;
+      value = value === null ? close : alpha * close + (1 - alpha) * value;
+      return value;
     });
   };
-  const ef = ema(fast), es = ema(slow);
-  let sum = 0;
-  const mt = out.map((c, i) => {
-    sum += Number(c.close);
-    if (i >= trend) sum -= Number(out[i - trend].close);
-    return i + 1 >= trend ? sum / trend : null;
-  });
+  const ef = ema(fast), es = ema(slow), mt = ema(trend);
   return out.map((c, i) => ({ ...c, ema_fast: ef[i], ema_slow: es[i], ma_trend: mt[i], ma_fast: ef[i], ma_slow: es[i], ema_trend: mt[i] }));
 }
 
@@ -117,15 +108,6 @@ function detectCrosses(candles: any[]) {
     if (Number(p.ema_fast) > Number(p.ema_slow) && Number(c.ema_fast) < Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close), type: 'SELL_CROSS' });
   }
   return crosses;
-}
-
-function fomoTh1(candles: any[], i: number) {
-  if (i < 20) return false;
-  const c = candles[i];
-  const body = Math.abs(Number(c.close) - Number(c.open));
-  const avg = candles.slice(i - 20, i).reduce((s, x) => s + Math.abs(Number(x.close) - Number(x.open)), 0) / 20;
-  const range = Number(c.high) - Number(c.low);
-  return avg > 0 && body > avg * 1.6 && range > 0 && body / range > 0.6;
 }
 
 function fomoTh2(candles: any[], i: number, crossPrice: number, side: 'BUY'|'SELL') {
@@ -1380,8 +1362,8 @@ export default function Backtest() {
   // Sideway 1: lọc vùng giá ±3 USD
 const [sideway1Filter, setSideway1Filter] = useState(true);
 
-// Sideway 2: lọc Candle Power
-const [sideway2Filter, setSideway2Filter] = useState(true);
+// Legacy compatibility only: Candle Power filter has been removed and remains disabled.
+const [sideway2Filter, setSideway2Filter] = useState(false);
   const [antiFomo, setAntiFomo] = useState(true);
 
   // Position management.
@@ -1512,9 +1494,9 @@ const [sideway2Filter, setSideway2Filter] = useState(true);
 
   function configLabel(c: RunConfig) {
     return [
-      `MA ${c.fast}/${c.slow}`, `Trend ${c.trend} ${c.maTrendEnabled ? 'ON' : 'OFF'}`,
-      c.sideway1Filter ? 'Sideway 1 ON' : 'Sideway 1 OFF',
-c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'FOMO OFF',
+      `MA ${c.fast}/${c.slow}`, `EMA Trend ${c.trend} ON`,
+      c.sideway1Filter ? 'Sideway ±3 ON' : 'Sideway ±3 OFF',
+      c.antiFomo ? 'FOMO TH2 ON' : 'FOMO TH2 OFF',
       c.breakEven ? 'BE ON' : 'BE OFF', c.trailing ? 'Trailing ON' : 'Trailing OFF',
       c.aiProfitExit ? 'AI Exit ON' : 'AI Exit OFF', c.fridayLock ? 'Friday ON' : 'Friday OFF',
       c.useTradingSession ? `Session ${c.sessionFrom}-${c.sessionTo}` : 'Session OFF',
@@ -1531,7 +1513,7 @@ c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'F
 
     if (result.length === 0) {
       if (cfg.antiFomo) add('fomo-off', 'Thử tắt Anti FOMO', 'Lần chạy hiện tại không có lệnh hoàn tất và Anti FOMO có thể đang loại quá nhiều tín hiệu.', 'Kiểm tra xem số lệnh có tăng mà chất lượng vẫn giữ được hay không.', { antiFomo: false });
-      if (cfg.sideway1Filter || cfg.sideway2Filter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', {
+      if (cfg.sideway1Filter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', {
    sideway1Filter: false,
   sideway2Filter: false,
 });
@@ -1553,7 +1535,7 @@ c.sideway2Filter ? 'Sideway 2 ON' : 'Sideway 2 OFF', c.antiFomo ? 'FOMO ON' : 'F
       } else if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision >= 70) {
         add('sideway-keep', 'Giữ Sideway để kiểm chứng thêm', `Sideway BLOCK ${stats.sideway.blocked} case và hiệu quả chặn ${sidewayPrecision.toFixed(1)}%.`, 'Chạy trên giai đoạn khác để xác nhận filter thực sự có lợi thế.', {
   sideway1Filter: true,
-  sideway2Filter: true,
+  sideway2Filter: false,
 });
       }
       if (cfg.breakEven) {
@@ -1652,7 +1634,7 @@ const antiFomo = runCfg.antiFomo;
     let peakBalance = balance;
     let maxDrawdown = 0;
     let lossStreak = 0;
-    let lastLossCrossPrice: number | null = null;
+    let lastLossEntryPrice: number | null = null;
     let open: any = null;
     let pendingLimit: any = null;
     let tradeId = 1;
@@ -1711,7 +1693,9 @@ const antiFomo = runCfg.antiFomo;
         reason,
       });
       lossStreak = r === 'LOSS' ? lossStreak + 1 : 0;
-      if (r === 'LOSS') lastLossCrossPrice = open.crossPrice;
+      if (r === 'LOSS') {
+        lastLossEntryPrice = open.entryPrice;
+      }
       open = null;
     };
 
@@ -1852,20 +1836,49 @@ const antiFomo = runCfg.antiFomo;
       // new cross survives MA/Sideway/FOMO and becomes BUY, SELL, BUY_LIMIT or
       // SELL_LIMIT.
 
-      // MA Cross + MA200 distance + MA Trend direction confirmation.
+      // Strategy order must match decision_engine: FOMO TH2 -> Sideway -> EMA trend -> SL/TP.
+      // In historical backtest, candle close is the available current market price.
+      const currentPrice = Number(c.close);
+
+      // STEP 1: FOMO TH2 only. TH1/TH3 and CandlePower are not entry gates.
+      if (antiFomo) {
+        fomo.checks++;
+        const th2 = fomoTh2(candles, i, currentPrice, side);
+        if (!th2) {
+          recordBlockedSignal(fomo, i, side, entry);
+          noTrade++;
+          continue;
+        }
+      }
+
+      // STEP 2: Sideway compares CURRENT PRICE with the most recent LOSS entry +/- 3.
+      // A later WIN must not erase the previous LOSS reference. Candle Power is not an entry gate.
+      const sidewayEnabled = sideway1Filter;
+      const finalEntry = entry;
+      if (sidewayEnabled && lastLossEntryPrice !== null) {
+        sideway.checks++;
+        const lower = lastLossEntryPrice - 3;
+        const upper = lastLossEntryPrice + 3;
+        if (currentPrice >= lower && currentPrice <= upper) {
+          recordBlockedSignal(sideway, i, side, currentPrice);
+          noTrade++;
+          continue;
+        }
+      }
+
+      // STEP 3: EMA trend direction and current-price distance must both agree with Cross.
       if (maTrendEnabled && trend > 0) {
         const ma = Number(c.ma_trend);
-        if (!Number.isFinite(ma)) {
+        const prevMa = i > 0 ? Number(candles[i - 1].ma_trend) : Number.NaN;
+        if (!Number.isFinite(ma) || !Number.isFinite(prevMa)) {
           noTrade++;
           continue;
         }
-        const distance = Math.abs(entry - ma);
-        if (distance < 3) {
-          noTrade++;
-          continue;
-        }
-        const trendSignal: 'BUY'|'SELL' = Number(c.close) > ma ? 'BUY' : 'SELL';
-        if (side !== trendSignal) {
+        const trendAligned = side === 'BUY' ? ma > prevMa : ma < prevMa;
+        const distancePass = side === 'BUY'
+          ? currentPrice >= ma + 3
+          : currentPrice <= ma - 3;
+        if (!trendAligned || !distancePass) {
           noTrade++;
           continue;
         }
@@ -1873,7 +1886,6 @@ const antiFomo = runCfg.antiFomo;
 
       if (useTradingSession) session.checks++;
       if (fridayLock) friday.checks++;
-
       if (!isWithinTradingSession(String(c.candle_time))) {
         recordBlockedSignal(session, i, side, entry);
         noTrade++;
@@ -1885,76 +1897,6 @@ const antiFomo = runCfg.antiFomo;
         continue;
       }
 
-      // Sideway filters are evaluated only after a loss, using the last loss cross ±3.
-      // Sideway 2: if the cross candle already has CP >= 1.4, keep the cross price.
-      // If CP < 1.4, calculate the price level where the candle body would reach 1.4x
-      // its average body, and use that level as Entry only when it lies inside this
-      // candle's High-Low range.
-      const sidewayEnabled = sideway1Filter || sideway2Filter;
-      let finalEntry = entry;
-
-      if (
-        sidewayEnabled &&
-        lossStreak >= 1 &&
-        lastLossCrossPrice !== null
-      ) {
-        sideway.checks++;
-
-        const lower = lastLossCrossPrice - 3;
-        const upper = lastLossCrossPrice + 3;
-        const cp = bodyPower(candles, i);
-        const outsideRange = entry < lower || entry > upper;
-
-        // SIDEWAY 1: block when the original cross price is inside the ±3 USD zone.
-        if (sideway1Filter && !outsideRange) {
-          recordBlockedSignal(sideway, i, side, entry);
-          noTrade++;
-          continue;
-        }
-
-        if (sideway2Filter && cp < 1.4) {
-          const candle = candles[i];
-          const high = Number(candle.high);
-          const low = Number(candle.low);
-          const openPrice = Number(candle.open);
-          const avgBody = i >= 20
-            ? candles.slice(i - 20, i).reduce(
-                (sum, previous) => sum + Math.abs(Number(previous.close) - Number(previous.open)),
-                0,
-              ) / 20
-            : 0;
-
-          // Price level at which the candle body reaches CP = 1.4.
-          const cpEntry = avgBody > 0
-            ? openPrice + (side === 'BUY' ? 1 : -1) * avgBody * 1.4
-            : Number.NaN;
-          const insideCandleRange = Number.isFinite(cpEntry) && cpEntry >= low && cpEntry <= high;
-
-          // If the CP=1.4 price level is outside this candle's High-Low, reject.
-          // If it is inside the range, use that exact price as the actual Entry.
-          if (!insideCandleRange) {
-            sideway.skippedCandlePower = (sideway.skippedCandlePower || 0) + 1;
-            noTrade++;
-            continue;
-          }
-
-          finalEntry = cpEntry;
-        }
-      }
-
-      if (antiFomo) {
-        fomo.checks++;
-
-        const th1 = fomoTh1(candles, i);
-        const th2 = fomoTh2(candles, i, entry, side);
-
-        // TH1 + TH2 => MARKET; otherwise BLOCK.
-        if (!(th1 && th2)) {
-          recordBlockedSignal(fomo, i, side, entry);
-          noTrade++;
-          continue;
-        }
-      }
       // THIS is the replace/cancel rule:
       // only now, after a real NEW strategy signal has been accepted, remove
       // the previous pending LIMIT. The new signal can then be MARKET or a new
@@ -2110,7 +2052,7 @@ async function start() {
         ma_slow: slow,
         ema_trend: trend,
         ma_trend: maTrendEnabled,
-        sideway_filter: sideway1Filter || sideway2Filter,
+        sideway_filter: sideway1Filter,
         anti_fomo: antiFomo,
         be: breakEven,
         trailing,
@@ -2207,15 +2149,6 @@ async function start() {
             <input type="number" value={trend} onChange={(e) => setTrend(+e.target.value)} />
           </label>
 
-          <label className="switch-row compact-switch">
-            <input type="checkbox" checked={maTrendEnabled} onChange={(e) => setMaTrendEnabled(e.target.checked)} />
-            <span className="switch" />
-            <span className="switch-content">
-              <strong>MA Trend Filter</strong>
-              <small>Yêu cầu Cross cách MA Trend tối thiểu ±3 giá</small>
-            </span>
-          </label>
-
           <div className="section-title space">FILTERS</div>
 
           <div className="strategy-option">
@@ -2228,31 +2161,20 @@ async function start() {
   />
   <span className="switch" />
   <span className="switch-content">
-    <strong>Sideway 1 — Price Range ±3</strong>
+    <strong>Sideway — Price Range ±3</strong>
     <small>Trong vùng ±3 USD sau lệnh thua thì BLOCK tín hiệu</small>
   </span>
 </label>
 
-<label className="switch-row">
-  <input
-    type="checkbox"
-    checked={sideway2Filter}
-    onChange={(e) => setSideway2Filter(e.target.checked)}
-  />
-  <span className="switch" />
-  <span className="switch-content">
-    <strong>Sideway 2 — Candle Power</strong>
-    <small>Nếu CP dưới 1.4, lấy mức giá đạt CP 1.4 làm Entry khi nằm trong High–Low của nến; ngoài phạm vi thì loại tín hiệu</small>
-  </span>
-</label>
+
 
 
             <label className="switch-row">
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
               <span className="switch" />
               <span className="switch-content">
-                <strong>Anti FOMO</strong>
-                <small>AI chống đánh đuổi giá</small>
+                <strong>FOMO TH2</strong>
+                <small>Kiểm tra FOMO TH2 trước khi xét Sideway và EMA Trend</small>
               </span>
             </label>
           </div>
@@ -2469,7 +2391,6 @@ async function start() {
               <div className="market-row"><span>MA Fast</span><b>{candle?.ma_fast?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>MA Slow</span><b>{candle?.ma_slow?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>EMA {trend}</span><b>{candle?.ema_trend?.toFixed(2) || '—'}</b></div>
-              <div className="market-row"><span>MA Trend Filter</span><b className={maTrendEnabled ? 'up' : ''}>{maTrendEnabled ? 'ON' : 'OFF'}</b></div>
 <div className="market-row">
   <span>Sideway 1 — Price Range</span>
   <b className={sideway1Filter ? 'up' : ''}>
@@ -2477,12 +2398,7 @@ async function start() {
   </b>
 </div>
 
-<div className="market-row">
-  <span>Sideway 2 — Candle Power</span>
-  <b className={sideway2Filter ? 'up' : ''}>
-    {sideway2Filter ? 'ON' : 'OFF'}
-  </b>
-</div>              <div className="market-row"><span>Anti FOMO</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
+              <div className="market-row"><span>FOMO TH2</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
               <div className="market-row"><span>AI Profit Exit</span><b className={aiProfitExit ? 'up' : ''}>{aiProfitExit ? 'ON' : 'OFF'}</b></div>
             </div>
 
@@ -2512,12 +2428,11 @@ async function start() {
                     <b>{blockRate === null ? '—' : `${blockRate.toFixed(1)}%`}</b>
                     <small>Đúng {st.correct} · Sai {st.wrong} · Chưa rõ {st.unknown}</small>
                     {precision !== null && <small>Hiệu quả chặn: {precision.toFixed(1)}%</small>}
-                    {name === 'SIDEWAY' && !!st.skippedCandlePower && <small>Loại tín hiệu: điểm giá đạt CP 1.4 nằm ngoài High–Low của nến: {st.skippedCandlePower}</small>}
                   </div>
                 );
               })}
             </div>
-            <div className="advisor-row"><div><span>TÍN HIỆU</span><b>{backtestStats.totalSignals}</b></div><div><span>ĐƯỢC VÀO</span><b>{backtestStats.acceptedSignals}</b></div><div><span>MARKET</span><b>{backtestStats.marketEntries}</b></div><div><span>LIMIT</span><b>{backtestStats.limitEntries}</b></div><div><span>NO TRADE</span><b>{backtestStats.noTrade}</b></div></div>
+            <div className="advisor-row"><div><span>TÍN HIỆU</span><b>{backtestStats.totalSignals}</b></div><div><span>ĐƯỢC VÀO</span><b>{backtestStats.acceptedSignals}</b></div><div><span>MARKET</span><b>{backtestStats.marketEntries}</b></div><div><span>NO TRADE</span><b>{backtestStats.noTrade}</b></div></div>
             <div className="ai-exit-summary">
               <div className="ai-exit-head"><span>AI PROFIT EXIT</span><b className={backtestStats.aiExit.enabled ? 'up' : ''}>{backtestStats.aiExit.enabled ? 'ACTIVE' : 'OFF'}</b></div>
               <div className="ai-exit-grid">
@@ -2548,9 +2463,9 @@ async function start() {
                     <div className="recommendation-top">
                       <div><span>ĐỀ XUẤT #{idx + 1}</span><strong>{r.title}</strong></div>
                       <button className="recommendation-run" disabled={botRunning} onClick={() => {
-                        setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(r.config.maTrendEnabled);
+                        setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(true);
                         setSideway1Filter(r.config.sideway1Filter);
-setSideway2Filter(r.config.sideway2Filter); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
+setSideway2Filter(false); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
                         setAiProfitExit(r.config.aiProfitExit); setFridayLock(r.config.fridayLock); setUseLotChain(r.config.useLotChain);
                         setBaseLot(r.config.baseLot); setUseTradingSession(r.config.useTradingSession); setSessionFrom(r.config.sessionFrom); setSessionTo(r.config.sessionTo);
                         setCustomLotChain(r.config.lotChain.join(', ')); setLotChainMode('custom');
