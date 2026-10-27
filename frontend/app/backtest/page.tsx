@@ -133,24 +133,113 @@ function addBollinger(candles: any[], period = 20, multiplier = 2) {
   });
 }
 
-function isBollingerTrend(candles: any[], i: number, pipThreshold: number, widthThreshold: number) {
-  if (i < 21) return false;
-  const c = candles[i], p = candles[i-1], p2 = candles[i-2];
-  if (![c.bbMiddle,c.bbUpper,c.bbLower,p.bbMiddle,p2.bbMiddle,c.bbWidth,p.bbUpper].every(Number.isFinite)) return false;
-  const slope = Number(p.bbMiddle) - Number(p2.bbMiddle);
-  const upperExpands = Number(c.bbUpper) > Number(p.bbUpper);
-  const lowerExpands = Number(c.bbLower) < Number(p.bbLower);
-  const bullish = Number(c.close) > Number(c.bbMiddle) && slope > pipThreshold && upperExpands;
-  const bearish = Number(c.close) < Number(c.bbMiddle) && slope < -pipThreshold && lowerExpands;
-  return Number(c.bbWidth) > widthThreshold && (bullish || bearish);
+function candleBodyRatio(c: any) {
+  const range = Number(c.high) - Number(c.low);
+  if (!Number.isFinite(range) || range <= 0) return 0;
+  return Math.abs(Number(c.close) - Number(c.open)) / range;
 }
 
-function isBollingerSideway(candles: any[], i: number, pipThreshold: number, widthThreshold: number) {
-  if (i < 21) return false;
-  const c = candles[i], p = candles[i-1], p2 = candles[i-2];
-  if (![c.bbMiddle,p.bbMiddle,p2.bbMiddle,c.bbWidth].every(Number.isFinite)) return false;
-  const slope = Math.abs(Number(p.bbMiddle) - Number(p2.bbMiddle));
-  return slope < pipThreshold && Number(c.bbWidth) < widthThreshold;
+/**
+ * Bollinger Band rules from the formula image.
+ *
+ * Important MT5 indexing:
+ *   [1] = latest fully closed candle
+ *   [2] = candle immediately before [1]
+ *
+ * The arrays here are chronological (oldest -> newest), so when `i` is
+ * the latest closed candle, [1] maps to candles[i] and [2] maps to candles[i - 1].
+ * BB middle = SMA20, upper/lower = SMA20 +/- 2 standard deviations.
+ */
+function isBollingerTrend(
+  candles: any[],
+  i: number,
+  pipThreshold: number,
+  widthThreshold: number,
+  isM1 = false,
+) {
+  if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
+
+  // [1] and [2] are candle shifts, NOT multiplication by (1) or (2).
+  const c1 = candles[i];     // MT5 [1]: latest closed candle
+  const c2 = candles[i - 1];  // MT5 [2]: previous closed candle
+  if (!c1 || !c2) return false;
+
+  const values = [
+    c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.bbWidth,
+    c1.close, c1.open, c1.high, c1.low,
+    c2.bbMiddle, c2.bbUpper, c2.bbLower,
+    c2.close, c2.open, c2.high, c2.low,
+  ];
+  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) {
+    return false;
+  }
+
+  // Delta SMA20 = SMA20[1] - SMA20[2].
+  // Positive slope confirms upward trend; negative slope confirms downward trend.
+  const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
+  const upperExpands = Number(c1.bbUpper) > Number(c2.bbUpper);
+  const lowerExpands = Number(c1.bbLower) < Number(c2.bbLower);
+  const bbExpanded = Number(c1.bbWidth) > widthThreshold;
+
+  // [1] candle close must be on the corresponding side of SMA20.
+  const bullishLocation = Number(c1.close) > Number(c1.bbMiddle);
+  const bearishLocation = Number(c1.close) < Number(c1.bbMiddle);
+
+  // For M1, [2] must also close on the same side of its own SMA20
+  // and its candle body must be >= 70% of the full candle range.
+  const previousBodyStrong = candleBodyRatio(c2) >= 0.70;
+  const m1BullishConfirm =
+    Number(c2.close) > Number(c2.bbMiddle) && previousBodyStrong;
+  const m1BearishConfirm =
+    Number(c2.close) < Number(c2.bbMiddle) && previousBodyStrong;
+
+  const bullish =
+    deltaSma20 > pipThreshold &&
+    bullishLocation &&
+    upperExpands &&
+    (!isM1 || m1BullishConfirm);
+
+  const bearish =
+    deltaSma20 < -pipThreshold &&
+    bearishLocation &&
+    lowerExpands &&
+    (!isM1 || m1BearishConfirm);
+
+  return bbExpanded && (bullish || bearish);
+}
+
+function isBollingerSideway(
+  candles: any[],
+  i: number,
+  pipThreshold: number,
+  widthThreshold: number,
+) {
+  if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
+
+  // [1] = latest closed candle; [2] = previous closed candle.
+  const c1 = candles[i];
+  const c2 = candles[i - 1];
+  if (!c1 || !c2) return false;
+
+  const values = [c1.bbMiddle, c1.bbWidth, c1.close, c2.bbMiddle];
+  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) {
+    return false;
+  }
+
+  // Delta SMA20 = SMA20[1] - SMA20[2], using the [2] candle explicitly.
+  const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
+  const close = Number(c1.close);
+  const middle = Number(c1.bbMiddle);
+
+  // Sideway: slope magnitude below threshold, BB width compressed,
+  // and [1] closing against the direction of the SMA20 slope.
+  const lowSlope = Math.abs(deltaSma20) < pipThreshold;
+  const compressed = Number(c1.bbWidth) < widthThreshold;
+  const closeAgainstTrend =
+    (deltaSma20 > 0 && close < middle) ||
+    (deltaSma20 < 0 && close > middle);
+
+  return lowSlope && compressed && closeAgainstTrend;
 }
 
 function detectCrosses(candles: any[]) {
@@ -1915,10 +2004,10 @@ const antiFomo = runCfg.antiFomo;
       const m15Bucket = Math.floor(Number(c.time) / 900) * 900;
       const m15Current = m15ByBucket.get(m15Bucket);
       const m15ClosedIndex = m15Current ? m15Current.index - 1 : -1;
-      const m15TrendBlocked = bbTrendM15 && !isBollingerTrend(m15Candles, m15ClosedIndex, 0.50, 10);
-      const m15SidewayBlocked = bbSidewayM15 && isBollingerSideway(m15Candles, m15ClosedIndex, 0.50, 10);
-      const m1TrendBlocked = bbTrendM1 && !isBollingerTrend(candles, m1Index, 0.20, 4);
-      const m1SidewayBlocked = bbSidewayM1 && isBollingerSideway(candles, m1Index, 0.20, 4);
+      const m15TrendBlocked = bbTrendM15 && !isBollingerTrend(m15Candles, m15ClosedIndex, 5.0, 10);
+      const m15SidewayBlocked = bbSidewayM15 && isBollingerSideway(m15Candles, m15ClosedIndex, 5.0, 10);
+      const m1TrendBlocked = bbTrendM1 && !isBollingerTrend(candles, m1Index, 2.0, 4, true);
+      const m1SidewayBlocked = bbSidewayM1 && isBollingerSideway(candles, m1Index, 2.0, 4);
       if (m15TrendBlocked || m15SidewayBlocked || m1TrendBlocked || m1SidewayBlocked) {
         noTrade++;
         continue;
