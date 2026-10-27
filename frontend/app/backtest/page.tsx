@@ -34,7 +34,9 @@ type FilterStat = {
 type RunConfig = {
   fast: number; slow: number; trend: number; maTrendEnabled: boolean;
   sideway1Filter: boolean;
-  sideway2Filter: boolean; antiFomo: boolean; breakEven: boolean; trailing: boolean;
+  sideway2Filter: boolean;
+  bbTrendM15: boolean; bbSidewayM15: boolean; bbTrendM1: boolean; bbSidewayM1: boolean;
+  antiFomo: boolean; breakEven: boolean; trailing: boolean;
   aiProfitExit: boolean; fridayLock: boolean; useLotChain: boolean;
   lotChain: number[]; baseLot: number; useTradingSession: boolean;
   sessionFrom: string; sessionTo: string;
@@ -98,6 +100,57 @@ function calcIndicators(candles: any[], fast: number, slow: number, trend: numbe
   };
   const ef = ema(fast), es = ema(slow), mt = ema(trend);
   return out.map((c, i) => ({ ...c, ema_fast: ef[i], ema_slow: es[i], ma_trend: mt[i], ma_fast: ef[i], ma_slow: es[i], ema_trend: mt[i] }));
+}
+
+
+function aggregateM15(candles: any[]) {
+  const buckets = new Map<number, any[]>();
+  for (const c of candles) {
+    const t = Number(c.time);
+    if (!Number.isFinite(t)) continue;
+    const bucket = Math.floor(t / 900) * 900;
+    if (!buckets.has(bucket)) buckets.set(bucket, []);
+    buckets.get(bucket)!.push(c);
+  }
+  return [...buckets.entries()].sort((a,b)=>a[0]-b[0]).map(([time, rows]) => ({
+    time, candle_time: String(rows[0].candle_time ?? ''),
+    open: Number(rows[0].open), high: Math.max(...rows.map(x=>Number(x.high))),
+    low: Math.min(...rows.map(x=>Number(x.low))), close: Number(rows[rows.length-1].close),
+    volume: rows.reduce((sum,x)=>sum+Number(x.tick_volume ?? x.volume ?? 0),0),
+    sourceCount: rows.length,
+  }));
+}
+
+function addBollinger(candles: any[], period = 20, multiplier = 2) {
+  const closes = candles.map(c => Number(c.close));
+  return candles.map((c, i) => {
+    if (i < period - 1) return { ...c, bbMiddle: null, bbUpper: null, bbLower: null, bbWidth: null };
+    const window = closes.slice(i-period+1, i+1);
+    const mean = window.reduce((a,b)=>a+b,0)/period;
+    const variance = window.reduce((a,b)=>a+Math.pow(b-mean,2),0)/period;
+    const sd = Math.sqrt(variance);
+    return { ...c, bbMiddle: mean, bbUpper: mean+multiplier*sd, bbLower: mean-multiplier*sd, bbWidth: 4*sd };
+  });
+}
+
+function isBollingerTrend(candles: any[], i: number, pipThreshold: number, widthThreshold: number) {
+  if (i < 21) return false;
+  const c = candles[i], p = candles[i-1], p2 = candles[i-2];
+  if (![c.bbMiddle,c.bbUpper,c.bbLower,p.bbMiddle,p2.bbMiddle,c.bbWidth,p.bbUpper].every(Number.isFinite)) return false;
+  const slope = Number(p.bbMiddle) - Number(p2.bbMiddle);
+  const upperExpands = Number(c.bbUpper) > Number(p.bbUpper);
+  const lowerExpands = Number(c.bbLower) < Number(p.bbLower);
+  const bullish = Number(c.close) > Number(c.bbMiddle) && slope > pipThreshold && upperExpands;
+  const bearish = Number(c.close) < Number(c.bbMiddle) && slope < -pipThreshold && lowerExpands;
+  return Number(c.bbWidth) > widthThreshold && (bullish || bearish);
+}
+
+function isBollingerSideway(candles: any[], i: number, pipThreshold: number, widthThreshold: number) {
+  if (i < 21) return false;
+  const c = candles[i], p = candles[i-1], p2 = candles[i-2];
+  if (![c.bbMiddle,p.bbMiddle,p2.bbMiddle,c.bbWidth].every(Number.isFinite)) return false;
+  const slope = Math.abs(Number(p.bbMiddle) - Number(p2.bbMiddle));
+  return slope < pipThreshold && Number(c.bbWidth) < widthThreshold;
 }
 
 function detectCrosses(candles: any[]) {
@@ -1180,72 +1233,46 @@ function calculateSlTp(
   side: 'BUY' | 'SELL',
   entry: number,
 ) {
-  // Fixed RR = 1 : 0.9
+  // SL theo cấu trúc 10 nến đã đóng trước nến vào lệnh.
+  // Khoảng SL tối đa: 8.0 đơn vị giá; đệm ngoài đỉnh/đáy: 0.1 đơn vị giá.
   const rr = 0.9;
+  const lookback = 10;
+  const buffer = 0.1;
+  const maxSlDistance = 8;
 
-  // Cần đủ 10 candle
-  if (index < 9) {
+  if (index < lookback || !Number.isFinite(entry) || entry <= 0) {
     return null;
   }
 
-  if (!Number.isFinite(entry) || entry <= 0) {
-    return null;
-  }
-
-  // 10 candle gần nhất, bao gồm candle hiện tại
-  const start = index - 9;
-  const tail = candles.slice(start, index + 1);
-
-  const lows = tail
+  // Chỉ lấy 10 nến trước đó, không bao gồm nến tín hiệu hiện tại.
+  const previousCandles = candles.slice(index - lookback, index);
+  const lows = previousCandles
     .map((c) => Number(c.low))
     .filter((v) => Number.isFinite(v));
-
-  const highs = tail
+  const highs = previousCandles
     .map((c) => Number(c.high))
     .filter((v) => Number.isFinite(v));
 
-  if (lows.length === 0 || highs.length === 0) {
+  if (lows.length !== lookback || highs.length !== lookback) {
     return null;
   }
 
-  // =========================
-  // BUY
-  // =========================
   if (side === 'BUY') {
-    const sl = Math.min(...lows);
-
+    // SL nằm thấp hơn đáy thấp nhất 0.1; không cho khoảng SL vượt quá 8 giá.
+    const structureSl = Math.min(...lows) - buffer;
+    const sl = Math.max(structureSl, entry - maxSlDistance);
     const risk = entry - sl;
-
-    if (risk <= 0) {
-      return null;
-    }
-
-    const tp = entry + risk * rr;
-
-    return {
-      sl,
-      tp,
-    };
+    if (risk <= 0) return null;
+    return { sl, tp: entry + risk * rr };
   }
 
-  // =========================
-  // SELL
-  // =========================
   if (side === 'SELL') {
-    const sl = Math.max(...highs);
-
+    // Đối xứng BUY: SL nằm cao hơn đỉnh cao nhất 0.1; tối đa 8 giá.
+    const structureSl = Math.max(...highs) + buffer;
+    const sl = Math.min(structureSl, entry + maxSlDistance);
     const risk = sl - entry;
-
-    if (risk <= 0) {
-      return null;
-    }
-
-    const tp = entry - risk * rr;
-
-    return {
-      sl,
-      tp,
-    };
+    if (risk <= 0) return null;
+    return { sl, tp: entry - risk * rr };
   }
 
   return null;
@@ -1364,6 +1391,11 @@ const [sideway1Filter, setSideway1Filter] = useState(true);
 
 // Legacy compatibility only: Candle Power filter has been removed and remains disabled.
 const [sideway2Filter, setSideway2Filter] = useState(false);
+  const [bbTrendM15, setBbTrendM15] = useState(false);
+  const [bbSidewayM15, setBbSidewayM15] = useState(false);
+  const [bbTrendM1, setBbTrendM1] = useState(false);
+  const [bbSidewayM1, setBbSidewayM1] = useState(false);
+  const [chartTimeframe, setChartTimeframe] = useState<'M1'|'M15'>('M1');
   const [antiFomo, setAntiFomo] = useState(true);
 
   // Position management.
@@ -1418,6 +1450,13 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   }, [playing, data, speed]);
 
   const candle = data?.candles?.[Math.max(0, visible - 1)];
+  const chartCandles = useMemo(() => {
+    if (!data?.candles) return [];
+    const base = chartTimeframe === 'M15' ? aggregateM15(data.candles) : data.candles;
+    return addBollinger(calcIndicators(base, fast, slow, trend));
+  }, [data, chartTimeframe, fast, slow, trend]);
+  const chartVisible = chartTimeframe === 'M15' ? Math.ceil(visible / 15) : visible;
+  const chartCrosses = useMemo(() => detectCrosses(chartCandles), [chartCandles]);
 
   const lotChain = useMemo(
     () =>
@@ -1478,6 +1517,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   maTrendEnabled,
   sideway1Filter,
   sideway2Filter,
+  bbTrendM15, bbSidewayM15, bbTrendM1, bbSidewayM1,
   antiFomo,
   breakEven,
   trailing,
@@ -1582,6 +1622,8 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
     const maTrendEnabled = runCfg.maTrendEnabled;
 const sideway1Filter = runCfg.sideway1Filter;
 const sideway2Filter = runCfg.sideway2Filter;
+const bbTrendM15 = runCfg.bbTrendM15; const bbSidewayM15 = runCfg.bbSidewayM15;
+const bbTrendM1 = runCfg.bbTrendM1; const bbSidewayM1 = runCfg.bbSidewayM1;
 const antiFomo = runCfg.antiFomo;
     const breakEven = runCfg.breakEven; const trailing = runCfg.trailing; const aiProfitExit = runCfg.aiProfitExit;
     const fridayLock = runCfg.fridayLock; const useLotChain = runCfg.useLotChain; const lotChain = runCfg.lotChain;
@@ -1619,7 +1661,9 @@ const antiFomo = runCfg.antiFomo;
     setPlaying(false);
     setBotRunning(true);
 
-    const candles = calcIndicators(data.candles, fast, slow, trend);
+    const candles = addBollinger(calcIndicators(data.candles, fast, slow, trend));
+    const m15Candles = addBollinger(aggregateM15(data.candles));
+    const m15ByBucket = new Map(m15Candles.map((c, idx) => [Number(c.time), { candle: c, index: idx }]));
     const crosses = detectCrosses(candles);
     const crossByIndex = new Map(crosses.map(x => [x.index, x]));
     const result: Trade[] = [];
@@ -1864,6 +1908,20 @@ const antiFomo = runCfg.antiFomo;
           noTrade++;
           continue;
         }
+      }
+
+      // Bollinger filters: evaluate M1 on the current candle and M15 only on the last fully closed M15 candle.
+      const m1Index = i;
+      const m15Bucket = Math.floor(Number(c.time) / 900) * 900;
+      const m15Current = m15ByBucket.get(m15Bucket);
+      const m15ClosedIndex = m15Current ? m15Current.index - 1 : -1;
+      const m15TrendBlocked = bbTrendM15 && !isBollingerTrend(m15Candles, m15ClosedIndex, 0.50, 10);
+      const m15SidewayBlocked = bbSidewayM15 && isBollingerSideway(m15Candles, m15ClosedIndex, 0.50, 10);
+      const m1TrendBlocked = bbTrendM1 && !isBollingerTrend(candles, m1Index, 0.20, 4);
+      const m1SidewayBlocked = bbSidewayM1 && isBollingerSideway(candles, m1Index, 0.20, 4);
+      if (m15TrendBlocked || m15SidewayBlocked || m1TrendBlocked || m1SidewayBlocked) {
+        noTrade++;
+        continue;
       }
 
       // STEP 3: EMA trend direction and current-price distance must both agree with Cross.
@@ -2128,8 +2186,9 @@ async function start() {
 
           <label>
             Timeframe
-            <select defaultValue="M1">
-              <option>M1</option>
+            <select value={chartTimeframe} onChange={(e) => setChartTimeframe(e.target.value as 'M1'|'M15')}>
+              <option value="M1">M1</option>
+              <option value="M15">M15</option>
             </select>
           </label>
 
@@ -2168,6 +2227,23 @@ async function start() {
 
 
 
+
+            <label className="switch-row">
+              <input type="checkbox" checked={bbTrendM15} onChange={(e) => setBbTrendM15(e.target.checked)} />
+              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M15</strong><small>SMA20 dốc &gt; 50 pip, BB mở rộng, độ rộng &gt; 10</small></span>
+            </label>
+            <label className="switch-row">
+              <input type="checkbox" checked={bbSidewayM15} onChange={(e) => setBbSidewayM15(e.target.checked)} />
+              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M15</strong><small>SMA20 dốc &lt; 50 pip, độ rộng BB &lt; 10</small></span>
+            </label>
+            <label className="switch-row">
+              <input type="checkbox" checked={bbTrendM1} onChange={(e) => setBbTrendM1(e.target.checked)} />
+              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M1</strong><small>SMA20 dốc &gt; 20 pip, BB mở rộng, độ rộng &gt; 4</small></span>
+            </label>
+            <label className="switch-row">
+              <input type="checkbox" checked={bbSidewayM1} onChange={(e) => setBbSidewayM1(e.target.checked)} />
+              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M1</strong><small>SMA20 dốc &lt; 20 pip, độ rộng BB &lt; 4</small></span>
+            </label>
 
             <label className="switch-row">
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
@@ -2355,7 +2431,7 @@ async function start() {
           <div className="chart-card">
             <div className="chart-head">
               <div>
-                <strong>XAUUSD · M1</strong>
+                <strong>{`XAUUSD · ${chartTimeframe}`}</strong>
                 <span>{candle ? fmt(candle.candle_time) : 'Ready for replay'}</span>
               </div>
 
@@ -2374,7 +2450,7 @@ async function start() {
             </div>
 
             {data ? (
-              <MarketChart candles={data.candles} visibleCount={visible} crosses={data.crosses} />
+              <MarketChart candles={chartCandles} visibleCount={chartVisible} crosses={chartCrosses} />
             ) : (
               <div className="empty">
                 <div className="empty-icon">⌁</div>
