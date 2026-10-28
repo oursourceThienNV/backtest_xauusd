@@ -32,6 +32,7 @@ type FilterStat = {
 };
 
 type RunConfig = {
+  strategyMode: 'ma' | 'bollinger';
   fast: number; slow: number; trend: number; maTrendEnabled: boolean;
   sideway1Filter: boolean;
   sideway2Filter: boolean;
@@ -42,6 +43,12 @@ type RunConfig = {
   aiProfitExit: boolean; fridayLock: boolean; useLotChain: boolean;
   lotChain: number[]; baseLot: number; useTradingSession: boolean;
   sessionFrom: string; sessionTo: string;
+};
+
+type SignalAudit = {
+  index: number; time: number; candle_time: string; side: 'BUY' | 'SELL'; price: number;
+  status: 'SIGNAL' | 'BLOCKED' | 'ENTERED' | 'SKIPPED';
+  reason: string;
 };
 
 type ConfigRecommendation = {
@@ -160,49 +167,49 @@ function isBollingerTrend(
   widthThreshold: number,
   isM1 = false,
 ): boolean {
-  // Arrays are chronological (oldest -> newest): [1] = candles[i], [2] = candles[i - 1].
-  if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
+  // Công thức: [1] là nến đóng gần nhất, [2] là nến đóng liền trước; dùng SMA20 của chính timeframe này.
+  // Mảng dữ liệu sắp theo thời gian tăng dần nên [1] = candles[i], [2] = candles[i - 1].
+  if (!Array.isArray(candles) || i < 20 || i >= candles.length || i < 1) return false;
 
   const c1 = candles[i];
   const c2 = candles[i - 1];
   if (!c1 || !c2) return false;
 
   const values = [
-    c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.bbWidth,
-    c1.close, c1.open, c1.high, c1.low,
-    c2.bbMiddle, c2.bbUpper, c2.bbLower,
-    c2.close, c2.open, c2.high, c2.low,
+    c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.close,
+    c2.bbMiddle, c2.bbUpper, c2.bbLower, c2.close,
+    c2.open, c2.high, c2.low,
   ];
   if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) return false;
 
-  // Delta SMA20 = SMA20[1] - SMA20[2]. [2] is a candle shift, not multiplication.
+  // Delta SMA20 luôn lấy trên đúng timeframe đang kiểm tra: M15 dùng SMA20_M15; M1 dùng SMA20_M1.
   const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
-  const bbWidth = Number(c1.bbUpper) - Number(c1.bbLower);
-  const widthExpandedEnough = bbWidth > widthThreshold;
+  const width = Number(c1.bbUpper) - Number(c1.bbLower);
+  if (!(width > widthThreshold)) return false;
 
-  // Trend up: SMA20 slope above threshold, [1] closes above SMA20,
-  // and upper band expands from [2] to [1].
+  // Trend mạnh tăng: độ dốc vượt ngưỡng, Close[1] nằm trên SMA20[1],
+  // và Upper[1] > Upper[2].
   const bullish =
     deltaSma20 > pipThreshold &&
     Number(c1.close) > Number(c1.bbMiddle) &&
     Number(c1.bbUpper) > Number(c2.bbUpper);
 
-  // Trend down: symmetric confirmation using the lower band.
+  // Trend mạnh giảm: đối xứng với xu hướng tăng.
   const bearish =
     deltaSma20 < -pipThreshold &&
     Number(c1.close) < Number(c1.bbMiddle) &&
     Number(c1.bbLower) < Number(c2.bbLower);
 
-  // M1 additionally requires candle [2] to close on the same side of its own
-  // SMA20 and its body to occupy at least 70% of the full candle range.
-  const previousBodyStrong = candleBodyRatio(c2) >= 0.70;
-  const m1BullishConfirm = Number(c2.close) > Number(c2.bbMiddle) && previousBodyStrong;
-  const m1BearishConfirm = Number(c2.close) < Number(c2.bbMiddle) && previousBodyStrong;
+  if (!isM1) return bullish || bearish;
 
-  return widthExpandedEnough && (
-    (bullish && (!isM1 || m1BullishConfirm)) ||
-    (bearish && (!isM1 || m1BearishConfirm))
-  );
+  // Riêng M1: nến [2] cũng phải đóng cùng phía SMA20 và thân nến >= 70% range.
+  const previousBodyStrong = candleBodyRatio(c2) >= 0.70;
+  const m1BullishConfirm =
+    Number(c2.close) > Number(c2.bbMiddle) && previousBodyStrong;
+  const m1BearishConfirm =
+    Number(c2.close) < Number(c2.bbMiddle) && previousBodyStrong;
+
+  return (bullish && m1BullishConfirm) || (bearish && m1BearishConfirm);
 }
 
 function isBollingerSideway(
@@ -211,26 +218,82 @@ function isBollingerSideway(
   pipThreshold: number,
   widthThreshold: number,
 ): boolean {
-  // [1] = latest fully closed candle; [2] = previous fully closed candle.
-  if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
+  // Sideway: |SMA20 của timeframe đang kiểm tra [1] - [2]| < ngưỡng và BB width < ngưỡng.
+  // Giá đóng cửa [1] phải ngược hướng độ dốc SMA20.
+  if (!Array.isArray(candles) || i < 20 || i >= candles.length || i < 1) return false;
 
   const c1 = candles[i];
   const c2 = candles[i - 1];
   if (!c1 || !c2) return false;
 
-  const values = [c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.close, c2.bbMiddle];
+  const values = [
+    c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.close,
+    c2.bbMiddle,
+  ];
   if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) return false;
 
-  // Delta SMA20 = SMA20[1] - SMA20[2]. Sideway requires a small absolute slope.
   const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
-  const bbWidth = Number(c1.bbUpper) - Number(c1.bbLower);
+  const width = Number(c1.bbUpper) - Number(c1.bbLower);
+
   const lowSlope = Math.abs(deltaSma20) < pipThreshold;
-  const compressed = bbWidth < widthThreshold;
+  const compressed = width < widthThreshold;
   const closeAgainstTrend =
     (deltaSma20 > 0 && Number(c1.close) < Number(c1.bbMiddle)) ||
     (deltaSma20 < 0 && Number(c1.close) > Number(c1.bbMiddle));
 
   return lowSlope && compressed && closeAgainstTrend;
+}
+
+// Phương pháp 2: tạo tín hiệu riêng theo công thức Trend mạnh M1; độ dốc dùng SMA20_M1[1] - SMA20_M1[2].
+// Không sử dụng EMA cross/EMA trend của Phương pháp 1.
+function detectBollingerSignals(candles: any[]) {
+  const signals: any[] = [];
+
+  // Bollinger signal rules are independent from the Trend/Sideway filters.
+  // Arrays are chronological (oldest -> newest):
+  // c1 = the prior closed candle, c2 = the newest closed candle (signal candle).
+  // BUY: c1 and c2 close above their own SMA20; c2 is bullish and its body >= 70% of range.
+  // SELL: c1 and c2 close below their own SMA20; c2 is bearish and its body >= 70% of range.
+  // Do not use SMA slope, Bollinger width, Trend, or Sideway thresholds to create signals.
+  for (let i = 20; i < candles.length; i++) {
+    const c1 = candles[i - 1];
+    const c2 = candles[i];
+    if (!c1 || !c2) continue;
+
+    const required = [
+      c1.bbMiddle, c1.close,
+      c2.bbMiddle, c2.open, c2.close, c2.high, c2.low,
+    ];
+    if (!required.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) continue;
+
+    const c2BodyStrong = candleBodyRatio(c2) >= 0.70;
+    const bullish =
+      Number(c1.close) > Number(c1.bbMiddle) &&
+      Number(c2.close) > Number(c2.bbMiddle) &&
+      Number(c2.close) > Number(c2.open) &&
+      c2BodyStrong;
+
+    const bearish =
+      Number(c1.close) < Number(c1.bbMiddle) &&
+      Number(c2.close) < Number(c2.bbMiddle) &&
+      Number(c2.close) < Number(c2.open) &&
+      c2BodyStrong;
+
+    if (bullish) {
+      signals.push({
+        index: i, time: Number(c2.time),
+        candle_time: String(c2.candle_time ?? ''),
+        price: Number(c2.close), type: 'BUY_CROSS',
+      });
+    } else if (bearish) {
+      signals.push({
+        index: i, time: Number(c2.time),
+        candle_time: String(c2.candle_time ?? ''),
+        price: Number(c2.close), type: 'SELL_CROSS',
+      });
+    }
+  }
+  return signals;
 }
 
 function detectCrosses(candles: any[]) {
@@ -243,6 +306,29 @@ function detectCrosses(candles: any[]) {
   return crosses;
 }
 
+/**
+ * Giá bình quân 10 nến đã đóng trước nến tín hiệu.
+ * Chỉ áp dụng làm giá vào lệnh cho Bollinger; không tham gia tạo tín hiệu.
+ * MA Cross tiếp tục dùng nguyên giá vào lệnh hiện có (giá đóng cửa nến cross).
+ */
+function averageCloseOfPrevious10Candles(candles: any[], index: number): number | null {
+  const lookback = 10;
+  if (!Array.isArray(candles) || index < lookback || index > candles.length) return null;
+
+  // Không bao gồm nến tín hiệu hiện tại để tránh dùng dữ liệu ngoài cửa sổ.
+  const previousCandles = candles.slice(index - lookback, index);
+  if (previousCandles.length !== lookback) return null;
+
+  const closes = previousCandles.map(c => Number(c.close));
+  if (!closes.every(Number.isFinite)) return null;
+
+  return closes.reduce((sum, value) => sum + value, 0) / lookback;
+}
+
+// Phương pháp Bollinger độc lập với MA Cross.
+// Bước 1: detectBollingerSignals xác nhận 2 nến cùng phía SMA20; nến tín hiệu có thân >= 70%.
+// Bước 2: chỉ những filter Bollinger được bật mới được quyền chặn tín hiệu.
+// Khi tất cả filter đều OFF, tín hiệu hợp lệ đi tiếp vào logic vào lệnh.
 function fomoTh2(candles: any[], i: number, crossPrice: number, side: 'BUY'|'SELL') {
   if (i < 3) return false;
   const cs = candles.slice(i - 3, i);
@@ -1313,7 +1399,9 @@ function calculateSlTp(
   side: 'BUY' | 'SELL',
   entry: number,
 ) {
-  // SL theo cấu trúc 10 nến đã đóng trước nến vào lệnh.
+  // Dùng đúng quy tắc quản lý rủi ro chung như MA Cross: phân tích 10 nến đã đóng
+  // trước nến vào lệnh để xác định vùng cấu trúc SL; không dùng nến tín hiệu tương lai.
+  // Lưu ý: đây là cấu trúc min(low)/max(high) của 10 nến, không phải trung bình cộng giá đóng cửa.
   // Khoảng SL tối đa: 8.0 đơn vị giá; đệm ngoài đỉnh/đáy: 0.1 đơn vị giá.
   const rr = 0.9;
   const lookback = 10;
@@ -1459,15 +1547,16 @@ export default function Backtest() {
   const [from, setFrom] = useState('2026-09-01');
   const [to, setTo] = useState('2026-09-30');
 
+  const [strategyMode, setStrategyMode] = useState<'ma' | 'bollinger'>('ma');
   const [fast, setFast] = useState(9);
   const [slow, setSlow] = useState(21);
   const [trend, setTrend] = useState(200);
-  const [maTrendEnabled, setMaTrendEnabled] = useState(true);
+  const [maTrendEnabled, setMaTrendEnabled] = useState(false);
   const [speed, setSpeed] = useState(1);
 
   // Filters - match Trend UI config names.
   // Sideway 1: lọc vùng giá ±3 USD
-const [sideway1Filter, setSideway1Filter] = useState(true);
+const [sideway1Filter, setSideway1Filter] = useState(false);
 
 // Legacy compatibility only: Candle Power filter has been removed and remains disabled.
 const [sideway2Filter, setSideway2Filter] = useState(false);
@@ -1486,13 +1575,13 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [bbSidewaySlopeM1Pips, setBbSidewaySlopeM1Pips] = useState(20);
   const [bbSidewayWidthM1, setBbSidewayWidthM1] = useState(4);
   const [chartTimeframe, setChartTimeframe] = useState<'M1'|'M15'>('M1');
-  const [antiFomo, setAntiFomo] = useState(true);
+  const [antiFomo, setAntiFomo] = useState(false);
 
   // Position management.
   const [breakEven, setBreakEven] = useState(true);
   const [trailing, setTrailing] = useState(true);
   const [aiProfitExit, setAiProfitExit] = useState(true);
-  const [fridayLock, setFridayLock] = useState(true);
+  const [fridayLock, setFridayLock] = useState(false);
 
   // Lot chain.
   const [useLotChain, setUseLotChain] = useState(false);
@@ -1509,6 +1598,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [initialBalance] = useState(100000);
   const [botRunning, setBotRunning] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [signalAudit, setSignalAudit] = useState<SignalAudit[]>([]);
   const [botBalance, setBotBalance] = useState(100000);
   const [backtestStats, setBacktestStats] = useState<BacktestStats>({ sideway: emptyFilterStat(), bollinger: { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() }, fomo: emptyFilterStat(), session: emptyFilterStat(), friday: emptyFilterStat(), totalSignals: 0, acceptedSignals: 0, marketEntries: 0, limitEntries: 0, noTrade: 0, advice: [], sessionAdvisor: emptySessionAdvisor(), aiExit: emptyAiExitStat() });
   const [recommendations, setRecommendations] = useState<ConfigRecommendation[]>([]);
@@ -1546,7 +1636,12 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
     return addBollinger(calcIndicators(base, fast, slow, trend));
   }, [data, chartTimeframe, fast, slow, trend]);
   const chartVisible = chartTimeframe === 'M15' ? Math.ceil(visible / 15) : visible;
-  const chartCrosses = useMemo(() => detectCrosses(chartCandles), [chartCandles]);
+  const chartCrosses = useMemo(
+    () => strategyMode === 'ma'
+      ? detectCrosses(chartCandles)
+      : detectBollingerSignals(chartCandles),
+    [chartCandles, strategyMode, bbSlopeM1Pips, bbWidthM1]
+  );
 
   const lotChain = useMemo(
     () =>
@@ -1601,6 +1696,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
    */
   function getCurrentConfig(): RunConfig {
    return {
+  strategyMode,
   fast,
   slow,
   trend,
@@ -1626,7 +1722,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
 
   function configLabel(c: RunConfig) {
     return [
-      `MA ${c.fast}/${c.slow}`, `EMA Trend ${c.trend} ON`,
+      c.strategyMode === 'ma' ? `Phương pháp 1 · MA ${c.fast}/${c.slow} · EMA Trend ${c.trend}` : 'Phương pháp 2 · Bollinger',
       c.sideway1Filter ? 'Sideway ±3 ON' : 'Sideway ±3 OFF',
       c.antiFomo ? 'FOMO TH2 ON' : 'FOMO TH2 OFF',
       c.breakEven ? 'BE ON' : 'BE OFF', c.trailing ? 'Trailing ON' : 'Trailing OFF',
@@ -1710,6 +1806,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
 
   async function runBot(overrides?: RunConfig) {
     const runCfg = overrides || getCurrentConfig();
+    const strategyMode = runCfg.strategyMode || 'ma';
     const fast = runCfg.fast; const slow = runCfg.slow; const trend = runCfg.trend;
     const maTrendEnabled = runCfg.maTrendEnabled;
 const sideway1Filter = runCfg.sideway1Filter;
@@ -1768,8 +1865,10 @@ const antiFomo = runCfg.antiFomo;
     const candles = addBollinger(calcIndicators(data.candles, fast, slow, trend));
     const m15Candles = addBollinger(aggregateM15(data.candles));
     const m15ByBucket = new Map(m15Candles.map((c, idx) => [Number(c.time), { candle: c, index: idx }]));
-    const crosses = detectCrosses(candles);
+    const crosses = strategyMode === 'ma' ? detectCrosses(candles) : detectBollingerSignals(candles);
     const crossByIndex = new Map(crosses.map(x => [x.index, x]));
+    const audit: SignalAudit[] = [];
+    const auditByIndex = new Map<number, SignalAudit>();
     const result: Trade[] = [];
     const sideway = emptyFilterStat();
     const bollinger = { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() };
@@ -1979,37 +2078,59 @@ const antiFomo = runCfg.antiFomo;
       if (!cross) continue;
       const side: 'BUY'|'SELL' = cross.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
       const entry = Number(cross.price);
+      const auditRow: SignalAudit = {
+        index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''),
+        side, price: entry, status: 'SIGNAL', reason: 'Tín hiệu được tạo theo xác nhận 2 nến SMA20; đang kiểm tra filter.',
+      };
+      audit.push(auditRow);
+      auditByIndex.set(i, auditRow);
+      const blockAudit = (reason: string) => {
+        auditRow.status = 'BLOCKED';
+        auditRow.reason = reason;
+      };
 
       // Evaluate the NEW strategy signal first. A pending LIMIT is NOT cancelled
       // merely because a cross appeared; it is cancelled/replaced only when the
       // new cross survives MA/Sideway/FOMO and becomes BUY, SELL, BUY_LIMIT or
       // SELL_LIMIT.
 
-      // Strategy order must match decision_engine: FOMO TH2 -> Sideway -> EMA trend -> SL/TP.
-      // In historical backtest, candle close is the available current market price.
+      // MA Cross và Bollinger đã có signal generator riêng. Sau khi có tín hiệu mới xét filter tương ứng.
+      // Trong backtest, giá đóng cửa nến tín hiệu là giá thị trường khả dụng.
       const currentPrice = Number(c.close);
 
-      // STEP 1: FOMO TH2 only. TH1/TH3 and CandlePower are not entry gates.
-      if (antiFomo) {
+      // MA Cross-only filter: FOMO TH2. Bollinger signals must not depend on MA Cross/FOMO.
+      if (strategyMode === 'ma' && antiFomo) {
         fomo.checks++;
         const th2 = fomoTh2(candles, i, currentPrice, side);
         if (!th2) {
           recordBlockedSignal(fomo, i, side, entry);
+          blockAudit('Anti FOMO TH2');
           noTrade++;
           continue;
         }
       }
 
-      // STEP 2: Sideway compares CURRENT PRICE with the most recent LOSS entry +/- 3.
+      // MA Cross-only filter: Sideway compares CURRENT PRICE with the most recent LOSS entry +/- 3.
       // A later WIN must not erase the previous LOSS reference. Candle Power is not an entry gate.
-      const sidewayEnabled = sideway1Filter;
-      const finalEntry = entry;
+      const sidewayEnabled = strategyMode === 'ma' && sideway1Filter;
+
+      // Chỉ Bollinger dùng giá bình quân 10 nến trước tín hiệu làm giá vào lệnh.
+      // Tín hiệu BUY/SELL vẫn lấy nguyên từ detectBollingerSignals; không sửa công thức tín hiệu.
+      // MA Cross giữ nguyên giá vào lệnh là giá đóng cửa nến cross.
+      const bollingerAverageEntry = strategyMode === 'bollinger'
+        ? averageCloseOfPrevious10Candles(candles, i)
+        : null;
+      const finalEntry = strategyMode === 'bollinger'
+        ? (bollingerAverageEntry ?? entry)
+        : entry;
+
       if (sidewayEnabled && lastLossEntryPrice !== null) {
         sideway.checks++;
         const lower = lastLossEntryPrice - 3;
         const upper = lastLossEntryPrice + 3;
         if (currentPrice >= lower && currentPrice <= upper) {
           recordBlockedSignal(sideway, i, side, currentPrice);
+          blockAudit('Sideway ±3');
           noTrade++;
           continue;
         }
@@ -2027,40 +2148,44 @@ const antiFomo = runCfg.antiFomo;
 
       let bollingerBlocked = false;
 
-      if (bbTrendM15) {
+      if (strategyMode === 'bollinger' && bbTrendM15) {
         bollinger.trendM15.checks++;
         const passed = isBollingerTrend(m15Candles, m15ClosedIndex, bbSlopeM15Price, bbWidthM15, false);
         if (!passed) {
           recordBlockedSignal(bollinger.trendM15, i, side, currentPrice);
+          blockAudit('Bollinger Trend M15');
           bollingerBlocked = true;
         }
       }
 
-      if (bbSidewayM15) {
+      if (strategyMode === 'bollinger' && bbSidewayM15) {
         bollinger.sidewayM15.checks++;
         const detected = isBollingerSideway(m15Candles, m15ClosedIndex, bbSidewaySlopeM15Price, bbSidewayWidthM15);
         if (detected) {
           recordBlockedSignal(bollinger.sidewayM15, i, side, currentPrice);
+          blockAudit('Bollinger Sideway M15');
           bollingerBlocked = true;
         }
       }
 
-      if (bbTrendM1) {
+      if (strategyMode === 'bollinger' && bbTrendM1) {
         bollinger.trendM1.checks++;
         // IMPORTANT: M1 is evaluated against the M1 candle series and M1 threshold, never M15.
         const passed = isBollingerTrend(candles, m1Index, bbSlopeM1Price, bbWidthM1, true);
         if (!passed) {
           recordBlockedSignal(bollinger.trendM1, i, side, currentPrice);
+          blockAudit('Bollinger Trend M1');
           bollingerBlocked = true;
         }
       }
 
-      if (bbSidewayM1) {
+      if (strategyMode === 'bollinger' && bbSidewayM1) {
         bollinger.sidewayM1.checks++;
         // Sideway M1 also uses M1 SMA20 delta and M1 BB width/threshold only.
         const detected = isBollingerSideway(candles, m1Index, bbSidewaySlopeM1Price, bbSidewayWidthM1);
         if (detected) {
           recordBlockedSignal(bollinger.sidewayM1, i, side, currentPrice);
+          blockAudit('Bollinger Sideway M1');
           bollingerBlocked = true;
         }
       }
@@ -2071,10 +2196,11 @@ const antiFomo = runCfg.antiFomo;
       }
 
       // STEP 3: EMA trend direction and current-price distance must both agree with Cross.
-      if (maTrendEnabled && trend > 0) {
+      if (strategyMode === 'ma' && maTrendEnabled && trend > 0) {
         const ma = Number(c.ma_trend);
         const prevMa = i > 0 ? Number(candles[i - 1].ma_trend) : Number.NaN;
         if (!Number.isFinite(ma) || !Number.isFinite(prevMa)) {
+          blockAudit('MA Trend: thiếu dữ liệu EMA');
           noTrade++;
           continue;
         }
@@ -2083,6 +2209,7 @@ const antiFomo = runCfg.antiFomo;
           ? currentPrice >= ma + 3
           : currentPrice <= ma - 3;
         if (!trendAligned || !distancePass) {
+          blockAudit(!trendAligned ? 'MA Trend: EMA không cùng hướng' : 'MA Trend: giá chưa cách EMA Trend đủ 3');
           noTrade++;
           continue;
         }
@@ -2092,11 +2219,13 @@ const antiFomo = runCfg.antiFomo;
       if (fridayLock) friday.checks++;
       if (!isWithinTradingSession(String(c.candle_time))) {
         recordBlockedSignal(session, i, side, entry);
+        blockAudit('Trading Session');
         noTrade++;
         continue;
       }
       if (isFridayLocked(String(c.candle_time))) {
         recordBlockedSignal(friday, i, side, entry);
+        blockAudit('Friday Lock');
         noTrade++;
         continue;
       }
@@ -2111,12 +2240,18 @@ const antiFomo = runCfg.antiFomo;
 
       // A valid opposite market/limit signal closes an existing position.
       if (open && open.side !== side) {
-        closeTrade(Number(c.time), String(c.candle_time), entry, 'Opposite MA Cross');
+        closeTrade(Number(c.time), String(c.candle_time), entry, strategyMode === 'ma' ? 'Opposite MA Cross' : 'Opposite Bollinger Signal');
       }
-      if (open) continue;
+      if (open) {
+        auditRow.status = 'SKIPPED';
+        auditRow.reason = 'Đã có vị thế mở cùng chiều; không mở thêm lệnh.';
+        continue;
+      }
       const sltp = calculateSlTp(candles, i, side, finalEntry);
 
           if (!sltp) {
+            auditRow.status = 'SKIPPED';
+            auditRow.reason = 'Không tính được SL/TP theo dữ liệu cấu trúc.';
             continue;
           }
 
@@ -2137,6 +2272,10 @@ const antiFomo = runCfg.antiFomo;
           };
       acceptedSignals++;
       marketEntries++;
+      auditRow.status = 'ENTERED';
+      auditRow.reason = strategyMode === 'bollinger'
+        ? `Đã mở lệnh MARKET theo tín hiệu Bollinger (2 nến cùng phía SMA20, thân nến tín hiệu >= 70%) sau khi vượt qua các filter đang bật. Giá vào lệnh = bình quân Close 10 nến trước: ${finalEntry.toFixed(2)}.`
+        : 'Đã mở lệnh MARKET theo tín hiệu MA Cross sau khi vượt qua các filter đang bật.';
     }
 
     if (open) {
@@ -2228,10 +2367,11 @@ const antiFomo = runCfg.antiFomo;
     setRecommendations(nextRecommendations);
     setRunHistory(prev => [...prev, { run: prev.length + 1, config: runCfg, pnl: balance - initialBalance, winRate: wr, profitFactor: pf, drawdown: maxDrawdown, trades: result.length }].slice(-20));
     setTrades(result);
+    setSignalAudit(audit);
     setBotBalance(Number(balance.toFixed(2)));
     setBotRunning(false);
     setVisible(candles.length);
-    setData((d:any) => ({ ...d, candles, crosses, lastBacktestConfig: currentConfigText }));
+    setData((d:any) => ({ ...d, candles, crosses, signalAudit: audit, lastBacktestConfig: currentConfigText }));
   }
 
   
@@ -2247,6 +2387,7 @@ async function start() {
   setPlaying(false);
   setBotRunning(true);
   setTrades([]);
+  setSignalAudit([]);
   setBotBalance(initialBalance);
 
   try {
@@ -2255,6 +2396,7 @@ async function start() {
     const d = await api('/api/replay/prepare', {
       method: 'POST',
       body: JSON.stringify({
+        strategy_mode: strategyMode,
         symbol: 'XAUUSD',
         timeframe: 'M1',
         from_time: `${from} 00:00:00`,
@@ -2329,6 +2471,12 @@ async function start() {
       <div className="workspace">
         <aside className="sidebar">
           <div className="section-title">REPLAY SETUP</div>
+          <label>Phương pháp giao dịch
+            <select value={strategyMode} onChange={(e) => setStrategyMode(e.target.value as 'ma' | 'bollinger')}>
+              <option value="ma">Phương pháp 1 — MA Cross + MA Trend 200</option>
+              <option value="bollinger">Phương pháp 2 — Bollinger</option>
+            </select>
+          </label>
 
           <label>
             Market
@@ -2345,27 +2493,22 @@ async function start() {
             </select>
           </label>
 
-          <div className="two">
-            <label>
-              MA Fast
-              <input type="number" value={fast} onChange={(e) => setFast(+e.target.value)} />
+          {strategyMode === 'ma' && <>
+            <div className="two">
+              <label>MA Fast<input type="number" value={fast} onChange={(e) => setFast(+e.target.value)} /></label>
+              <label>MA Slow<input type="number" value={slow} onChange={(e) => setSlow(+e.target.value)} /></label>
+            </div>
+            <label>MA Trend period<input type="number" value={trend} onChange={(e) => setTrend(+e.target.value)} /></label>
+            <label className="switch-row">
+              <input type="checkbox" checked={maTrendEnabled} onChange={(e) => setMaTrendEnabled(e.target.checked)} />
+              <span className="switch" /><span className="switch-content"><strong>MA Trend ON/OFF</strong><small>Khi tắt, bỏ lọc hướng và khoảng cách với EMA Trend.</small></span>
             </label>
-            <label>
-              MA Slow
-              <input type="number" value={slow} onChange={(e) => setSlow(+e.target.value)} />
-            </label>
-          </div>
-
-          <label>
-            EMA Trend
-            <input type="number" value={trend} onChange={(e) => setTrend(+e.target.value)} />
-          </label>
+          </>}
 
           <div className="section-title space">FILTERS</div>
 
           <div className="strategy-option">
-            
-<label className="switch-row">
+            {strategyMode === 'ma' && <label className="switch-row">
   <input
     type="checkbox"
     checked={sideway1Filter}
@@ -2376,11 +2519,9 @@ async function start() {
     <strong>Sideway — Price Range ±3</strong>
     <small>Trong vùng ±3 USD sau lệnh thua thì BLOCK tín hiệu</small>
   </span>
-</label>
+</label>}
 
-
-
-
+            {strategyMode === 'bollinger' && <>
             <label className="switch-row">
               <input type="checkbox" checked={bbTrendM15} onChange={(e) => setBbTrendM15(e.target.checked)} />
               <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M15</strong><small>PASS khi đồng thời: độ dốc SMA20 M15 vượt ngưỡng, giá đóng đúng phía SMA20, BB mở rộng và độ rộng BB vượt ngưỡng. Không đạt đủ = trend yếu, BLOCK.</small></span>
@@ -2430,14 +2571,16 @@ async function start() {
               </label>
             </div>
 
-            <label className="switch-row">
+            </>}
+
+            {strategyMode === 'ma' && <label className="switch-row">
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
               <span className="switch" />
               <span className="switch-content">
                 <strong>FOMO TH2</strong>
                 <small>Kiểm tra FOMO TH2 trước khi xét Sideway và EMA Trend</small>
               </span>
-            </label>
+            </label>}
           </div>
 
           <div className="section-title space">POSITION MANAGEMENT</div>
@@ -2598,9 +2741,9 @@ async function start() {
           {error && <div className="error">{error}</div>}
 
           <div className="legend">
-            <span><i className="dot orange" />MA Fast</span>
-            <span><i className="dot purple" />MA Slow</span>
-            <span><i className="dot cyan" />EMA Trend</span>
+            {strategyMode === 'ma' ? <>
+              <span><i className="dot orange" />MA Fast</span><span><i className="dot purple" />MA Slow</span><span><i className="dot cyan" />EMA Trend</span>
+            </> : <><span><i className="dot orange" />BB Upper</span><span><i className="dot purple" />SMA20</span><span><i className="dot cyan" />BB Lower</span></>}
           </div>
         </aside>
 
@@ -2616,7 +2759,7 @@ async function start() {
           <div className="chart-card">
             <div className="chart-head">
               <div>
-                <strong>{`XAUUSD · ${chartTimeframe}`}</strong>
+                <strong>{`XAUUSD · ${chartTimeframe} · ${strategyMode === 'ma' ? 'MA Cross' : 'Bollinger'}`}</strong>
                 <span>{candle ? fmt(candle.candle_time) : 'Ready for replay'}</span>
               </div>
 
@@ -2635,7 +2778,7 @@ async function start() {
             </div>
 
             {data ? (
-              <MarketChart candles={chartCandles} visibleCount={chartVisible} crosses={chartCrosses} />
+              <MarketChart candles={chartCandles} visibleCount={chartVisible} crosses={chartTimeframe === 'M1' && signalAudit.length ? signalAudit.map(a => ({ index: a.index, time: a.time, price: a.price, type: a.side === 'BUY' ? 'BUY_CROSS' : 'SELL_CROSS', status: a.status === 'BLOCKED' ? 'BLOCKED' : a.status === 'ENTERED' ? 'ENTERED' : 'SKIPPED', reason: a.reason })) : chartCrosses} strategyMode={strategyMode} />
             ) : (
               <div className="empty">
                 <div className="empty-icon">⌁</div>
@@ -2673,6 +2816,41 @@ async function start() {
                   <small>{x.trend}</small>
                 </div>
               )) || <div className="muted">No replay loaded.</div>}
+            </div>
+          </div>
+
+          <div className="panel signal-audit-panel">
+            <div className="panel-title">SIGNAL / FILTER AUDIT — TOÀN BỘ KHOẢNG THỜI GIAN</div>
+            <div className="advisor-row">
+              <div><span>TÍN HIỆU</span><b>{signalAudit.length}</b></div>
+              <div><span>VÀO LỆNH</span><b>{signalAudit.filter(x => x.status === 'ENTERED').length}</b></div>
+              <div><span>BỊ FILTER CHẶN</span><b>{signalAudit.filter(x => x.status === 'BLOCKED').length}</b></div>
+              <div><span>BỎ QUA</span><b>{signalAudit.filter(x => x.status === 'SKIPPED').length}</b></div>
+            </div>
+            <div style={{ overflowX: 'auto', maxHeight: 420, overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead><tr>
+                  <th style={{textAlign:'left',padding:8}}>Thời gian</th>
+                  <th style={{textAlign:'left',padding:8}}>Phương pháp</th>
+                  <th style={{textAlign:'left',padding:8}}>Side</th>
+                  <th style={{textAlign:'right',padding:8}}>Giá tín hiệu</th>
+                  <th style={{textAlign:'left',padding:8}}>Trạng thái</th>
+                  <th style={{textAlign:'left',padding:8}}>Lý do</th>
+                </tr></thead>
+                <tbody>
+                  {[...signalAudit].reverse().map((x) => (
+                    <tr key={`${x.index}-${x.time}`} style={{borderTop:'1px solid #242a35'}}>
+                      <td style={{padding:8,whiteSpace:'nowrap'}}>{fmt(x.candle_time)}</td>
+                      <td style={{padding:8}}>{strategyMode === 'ma' ? 'MA Cross' : 'Bollinger'}</td>
+                      <td style={{padding:8,color:x.side === 'BUY' ? '#22c55e' : '#ef4444'}}>{x.side}</td>
+                      <td style={{padding:8,textAlign:'right'}}>{x.price.toFixed(2)}</td>
+                      <td style={{padding:8,color:x.status === 'ENTERED' ? '#22c55e' : x.status === 'BLOCKED' ? '#f59e0b' : '#94a3b8'}}>{x.status}</td>
+                      <td style={{padding:8}}>{x.reason}</td>
+                    </tr>
+                  ))}
+                  {!signalAudit.length && <tr><td colSpan={6} style={{padding:12,color:'#94a3b8'}}>Chưa có dữ liệu. Hãy START REPLAY rồi RUN BOT để tạo lịch sử kiểm tra.</td></tr>}
+                </tbody>
+              </table>
             </div>
           </div>
 
@@ -2726,6 +2904,7 @@ async function start() {
                       <button className="recommendation-run" disabled={botRunning} onClick={() => {
                         setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(true);
                         setSideway1Filter(r.config.sideway1Filter);
+                        setStrategyMode(r.config.strategyMode || 'ma');
                         setBbTrendM15(r.config.bbTrendM15); setBbSidewayM15(r.config.bbSidewayM15);
                         setBbTrendM1(r.config.bbTrendM1); setBbSidewayM1(r.config.bbSidewayM1);
                         setBbSlopeM15Pips(r.config.bbSlopeM15Pips); setBbWidthM15(r.config.bbWidthM15);
@@ -2843,6 +3022,45 @@ setSideway2Filter(false); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.
                     <tr>
                       <td colSpan={10} className="empty-table">Chưa có lệnh. Hãy START REPLAY rồi bấm RUN BOT.</td>
                     </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="panel trades-panel">
+            <div className="panel-title">SIGNAL & FILTER HISTORY</div>
+            <div className="trade-table-wrap">
+              <table className="trade-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Time</th>
+                    <th>Signal</th>
+                    <th>Price</th>
+                    <th>Status</th>
+                    <th>Filter / explanation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {signalAudit.length ? signalAudit.map((item, idx) => (
+                    <tr key={`${item.index}-${item.side}-${idx}`}>
+                      <td>{idx + 1}</td>
+                      <td>{fmt(item.candle_time)}</td>
+                      <td className={item.side === 'BUY' ? 'buy' : 'sell'}>{item.side}</td>
+                      <td>{Number(item.price).toFixed(2)}</td>
+                      <td>
+                        <span className={`result ${item.status.toLowerCase()}`}>
+                          {item.status === 'ENTERED' ? 'ĐÃ VÀO LỆNH'
+                            : item.status === 'BLOCKED' ? 'BỊ FILTER CHẶN'
+                            : item.status === 'SKIPPED' ? 'BỎ QUA'
+                            : 'TÍN HIỆU'}
+                        </span>
+                      </td>
+                      <td>{item.reason || (item.status === 'ENTERED' ? 'Không có filter nào chặn tín hiệu.' : 'Không có lý do chi tiết.')}</td>
+                    </tr>
+                  )) : (
+                    <tr><td colSpan={6} className="empty-table">Chưa có lịch sử tín hiệu. Hãy START REPLAY rồi RUN BOT.</td></tr>
                   )}
                 </tbody>
               </table>
