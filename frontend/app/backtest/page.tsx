@@ -36,6 +36,8 @@ type RunConfig = {
   sideway1Filter: boolean;
   sideway2Filter: boolean;
   bbTrendM15: boolean; bbSidewayM15: boolean; bbTrendM1: boolean; bbSidewayM1: boolean;
+  bbSlopeM15Pips: number; bbWidthM15: number; bbSlopeM1Pips: number; bbWidthM1: number;
+  bbSidewaySlopeM15Pips: number; bbSidewayWidthM15: number; bbSidewaySlopeM1Pips: number; bbSidewayWidthM1: number;
   antiFomo: boolean; breakEven: boolean; trailing: boolean;
   aiProfitExit: boolean; fridayLock: boolean; useLotChain: boolean;
   lotChain: number[]; baseLot: number; useTradingSession: boolean;
@@ -52,6 +54,7 @@ type ConfigRecommendation = {
 
 type BacktestStats = {
   sideway: FilterStat;
+  bollinger: { trendM15: FilterStat; sidewayM15: FilterStat; trendM1: FilterStat; sidewayM1: FilterStat };
   fomo: FilterStat;
   session: FilterStat;
   friday: FilterStat;
@@ -156,12 +159,12 @@ function isBollingerTrend(
   pipThreshold: number,
   widthThreshold: number,
   isM1 = false,
-) {
+): boolean {
+  // Arrays are chronological (oldest -> newest): [1] = candles[i], [2] = candles[i - 1].
   if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
 
-  // [1] and [2] are candle shifts, NOT multiplication by (1) or (2).
-  const c1 = candles[i];     // MT5 [1]: latest closed candle
-  const c2 = candles[i - 1];  // MT5 [2]: previous closed candle
+  const c1 = candles[i];
+  const c2 = candles[i - 1];
   if (!c1 || !c2) return false;
 
   const values = [
@@ -170,42 +173,36 @@ function isBollingerTrend(
     c2.bbMiddle, c2.bbUpper, c2.bbLower,
     c2.close, c2.open, c2.high, c2.low,
   ];
-  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) {
-    return false;
-  }
+  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) return false;
 
-  // Delta SMA20 = SMA20[1] - SMA20[2].
-  // Positive slope confirms upward trend; negative slope confirms downward trend.
+  // Delta SMA20 = SMA20[1] - SMA20[2]. [2] is a candle shift, not multiplication.
   const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
-  const upperExpands = Number(c1.bbUpper) > Number(c2.bbUpper);
-  const lowerExpands = Number(c1.bbLower) < Number(c2.bbLower);
-  const bbExpanded = Number(c1.bbWidth) > widthThreshold;
+  const bbWidth = Number(c1.bbUpper) - Number(c1.bbLower);
+  const widthExpandedEnough = bbWidth > widthThreshold;
 
-  // [1] candle close must be on the corresponding side of SMA20.
-  const bullishLocation = Number(c1.close) > Number(c1.bbMiddle);
-  const bearishLocation = Number(c1.close) < Number(c1.bbMiddle);
-
-  // For M1, [2] must also close on the same side of its own SMA20
-  // and its candle body must be >= 70% of the full candle range.
-  const previousBodyStrong = candleBodyRatio(c2) >= 0.70;
-  const m1BullishConfirm =
-    Number(c2.close) > Number(c2.bbMiddle) && previousBodyStrong;
-  const m1BearishConfirm =
-    Number(c2.close) < Number(c2.bbMiddle) && previousBodyStrong;
-
+  // Trend up: SMA20 slope above threshold, [1] closes above SMA20,
+  // and upper band expands from [2] to [1].
   const bullish =
     deltaSma20 > pipThreshold &&
-    bullishLocation &&
-    upperExpands &&
-    (!isM1 || m1BullishConfirm);
+    Number(c1.close) > Number(c1.bbMiddle) &&
+    Number(c1.bbUpper) > Number(c2.bbUpper);
 
+  // Trend down: symmetric confirmation using the lower band.
   const bearish =
     deltaSma20 < -pipThreshold &&
-    bearishLocation &&
-    lowerExpands &&
-    (!isM1 || m1BearishConfirm);
+    Number(c1.close) < Number(c1.bbMiddle) &&
+    Number(c1.bbLower) < Number(c2.bbLower);
 
-  return bbExpanded && (bullish || bearish);
+  // M1 additionally requires candle [2] to close on the same side of its own
+  // SMA20 and its body to occupy at least 70% of the full candle range.
+  const previousBodyStrong = candleBodyRatio(c2) >= 0.70;
+  const m1BullishConfirm = Number(c2.close) > Number(c2.bbMiddle) && previousBodyStrong;
+  const m1BearishConfirm = Number(c2.close) < Number(c2.bbMiddle) && previousBodyStrong;
+
+  return widthExpandedEnough && (
+    (bullish && (!isM1 || m1BullishConfirm)) ||
+    (bearish && (!isM1 || m1BearishConfirm))
+  );
 }
 
 function isBollingerSideway(
@@ -213,31 +210,25 @@ function isBollingerSideway(
   i: number,
   pipThreshold: number,
   widthThreshold: number,
-) {
+): boolean {
+  // [1] = latest fully closed candle; [2] = previous fully closed candle.
   if (!Array.isArray(candles) || i < 20 || i >= candles.length) return false;
 
-  // [1] = latest closed candle; [2] = previous closed candle.
   const c1 = candles[i];
   const c2 = candles[i - 1];
   if (!c1 || !c2) return false;
 
-  const values = [c1.bbMiddle, c1.bbWidth, c1.close, c2.bbMiddle];
-  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) {
-    return false;
-  }
+  const values = [c1.bbMiddle, c1.bbUpper, c1.bbLower, c1.close, c2.bbMiddle];
+  if (!values.every(v => v !== null && v !== undefined && Number.isFinite(Number(v)))) return false;
 
-  // Delta SMA20 = SMA20[1] - SMA20[2], using the [2] candle explicitly.
+  // Delta SMA20 = SMA20[1] - SMA20[2]. Sideway requires a small absolute slope.
   const deltaSma20 = Number(c1.bbMiddle) - Number(c2.bbMiddle);
-  const close = Number(c1.close);
-  const middle = Number(c1.bbMiddle);
-
-  // Sideway: slope magnitude below threshold, BB width compressed,
-  // and [1] closing against the direction of the SMA20 slope.
+  const bbWidth = Number(c1.bbUpper) - Number(c1.bbLower);
   const lowSlope = Math.abs(deltaSma20) < pipThreshold;
-  const compressed = Number(c1.bbWidth) < widthThreshold;
+  const compressed = bbWidth < widthThreshold;
   const closeAgainstTrend =
-    (deltaSma20 > 0 && close < middle) ||
-    (deltaSma20 < 0 && close > middle);
+    (deltaSma20 > 0 && Number(c1.close) < Number(c1.bbMiddle)) ||
+    (deltaSma20 < 0 && Number(c1.close) > Number(c1.bbMiddle));
 
   return lowSlope && compressed && closeAgainstTrend;
 }
@@ -1484,6 +1475,16 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [bbSidewayM15, setBbSidewayM15] = useState(false);
   const [bbTrendM1, setBbTrendM1] = useState(false);
   const [bbSidewayM1, setBbSidewayM1] = useState(false);
+  // Slope thresholds are entered in pips. For this XAUUSD rule, 10 pips = 1.0 price, so 50 pips = 5.0 price.
+  const [bbSlopeM15Pips, setBbSlopeM15Pips] = useState(50);
+  const [bbWidthM15, setBbWidthM15] = useState(10);
+  const [bbSlopeM1Pips, setBbSlopeM1Pips] = useState(20);
+  const [bbWidthM1, setBbWidthM1] = useState(4);
+  // Sideway thresholds are independently editable from Trend-strong thresholds.
+  const [bbSidewaySlopeM15Pips, setBbSidewaySlopeM15Pips] = useState(50);
+  const [bbSidewayWidthM15, setBbSidewayWidthM15] = useState(10);
+  const [bbSidewaySlopeM1Pips, setBbSidewaySlopeM1Pips] = useState(20);
+  const [bbSidewayWidthM1, setBbSidewayWidthM1] = useState(4);
   const [chartTimeframe, setChartTimeframe] = useState<'M1'|'M15'>('M1');
   const [antiFomo, setAntiFomo] = useState(true);
 
@@ -1509,7 +1510,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [botRunning, setBotRunning] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [botBalance, setBotBalance] = useState(100000);
-  const [backtestStats, setBacktestStats] = useState<BacktestStats>({ sideway: emptyFilterStat(), fomo: emptyFilterStat(), session: emptyFilterStat(), friday: emptyFilterStat(), totalSignals: 0, acceptedSignals: 0, marketEntries: 0, limitEntries: 0, noTrade: 0, advice: [], sessionAdvisor: emptySessionAdvisor(), aiExit: emptyAiExitStat() });
+  const [backtestStats, setBacktestStats] = useState<BacktestStats>({ sideway: emptyFilterStat(), bollinger: { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() }, fomo: emptyFilterStat(), session: emptyFilterStat(), friday: emptyFilterStat(), totalSignals: 0, acceptedSignals: 0, marketEntries: 0, limitEntries: 0, noTrade: 0, advice: [], sessionAdvisor: emptySessionAdvisor(), aiExit: emptyAiExitStat() });
   const [recommendations, setRecommendations] = useState<ConfigRecommendation[]>([]);
   const [runHistory, setRunHistory] = useState<Array<{ run: number; config: RunConfig; pnl: number; winRate: number; profitFactor: number; drawdown: number; trades: number }>>([]);
 
@@ -1607,6 +1608,8 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   sideway1Filter,
   sideway2Filter,
   bbTrendM15, bbSidewayM15, bbTrendM1, bbSidewayM1,
+  bbSlopeM15Pips, bbWidthM15, bbSlopeM1Pips, bbWidthM1,
+  bbSidewaySlopeM15Pips, bbSidewayWidthM15, bbSidewaySlopeM1Pips, bbSidewayWidthM1,
   antiFomo,
   breakEven,
   trailing,
@@ -1713,6 +1716,18 @@ const sideway1Filter = runCfg.sideway1Filter;
 const sideway2Filter = runCfg.sideway2Filter;
 const bbTrendM15 = runCfg.bbTrendM15; const bbSidewayM15 = runCfg.bbSidewayM15;
 const bbTrendM1 = runCfg.bbTrendM1; const bbSidewayM1 = runCfg.bbSidewayM1;
+const bbSlopeM15Pips = Math.max(0, Number(runCfg.bbSlopeM15Pips) || 0);
+const bbWidthM15 = Math.max(0, Number(runCfg.bbWidthM15) || 0);
+const bbSlopeM1Pips = Math.max(0, Number(runCfg.bbSlopeM1Pips) || 0);
+const bbWidthM1 = Math.max(0, Number(runCfg.bbWidthM1) || 0);
+const bbSidewaySlopeM15Price = Math.max(0, Number(runCfg.bbSidewaySlopeM15Pips) || 0) / 10;
+const bbSidewayWidthM15 = Math.max(0, Number(runCfg.bbSidewayWidthM15) || 0);
+const bbSidewaySlopeM1Price = Math.max(0, Number(runCfg.bbSidewaySlopeM1Pips) || 0) / 10;
+const bbSidewayWidthM1 = Math.max(0, Number(runCfg.bbSidewayWidthM1) || 0);
+// Convert pip thresholds to XAUUSD price units independently per timeframe.
+// 50 pip = 5.0 price; 20 pip = 2.0 price. M1 MUST use only bbSlopeM1Price.
+const bbSlopeM15Price = bbSlopeM15Pips / 10;
+const bbSlopeM1Price = bbSlopeM1Pips / 10;
 const antiFomo = runCfg.antiFomo;
     const breakEven = runCfg.breakEven; const trailing = runCfg.trailing; const aiProfitExit = runCfg.aiProfitExit;
     const fridayLock = runCfg.fridayLock; const useLotChain = runCfg.useLotChain; const lotChain = runCfg.lotChain;
@@ -1757,6 +1772,7 @@ const antiFomo = runCfg.antiFomo;
     const crossByIndex = new Map(crosses.map(x => [x.index, x]));
     const result: Trade[] = [];
     const sideway = emptyFilterStat();
+    const bollinger = { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() };
     const fomo = emptyFilterStat();
     const session = emptyFilterStat();
     const friday = emptyFilterStat();
@@ -1999,16 +2015,57 @@ const antiFomo = runCfg.antiFomo;
         }
       }
 
-      // Bollinger filters: evaluate M1 on the current candle and M15 only on the last fully closed M15 candle.
+      // Bollinger filters use AND semantics: every enabled filter must pass.
+      // Trend ON => all Trend-strong conditions must pass, otherwise BLOCK (weak/unclear trend).
+      // Sideway ON => BLOCK only when every Sideway condition is true; otherwise it passes.
+      // Evaluate filters independently for per-filter statistics. M15 uses the last
+      // fully closed M15 candle; M1 slope/BB calculations use M1 candles and M1 thresholds only.
       const m1Index = i;
       const m15Bucket = Math.floor(Number(c.time) / 900) * 900;
       const m15Current = m15ByBucket.get(m15Bucket);
       const m15ClosedIndex = m15Current ? m15Current.index - 1 : -1;
-      const m15TrendBlocked = bbTrendM15 && !isBollingerTrend(m15Candles, m15ClosedIndex, 5.0, 10);
-      const m15SidewayBlocked = bbSidewayM15 && isBollingerSideway(m15Candles, m15ClosedIndex, 5.0, 10);
-      const m1TrendBlocked = bbTrendM1 && !isBollingerTrend(candles, m1Index, 2.0, 4, true);
-      const m1SidewayBlocked = bbSidewayM1 && isBollingerSideway(candles, m1Index, 2.0, 4);
-      if (m15TrendBlocked || m15SidewayBlocked || m1TrendBlocked || m1SidewayBlocked) {
+
+      let bollingerBlocked = false;
+
+      if (bbTrendM15) {
+        bollinger.trendM15.checks++;
+        const passed = isBollingerTrend(m15Candles, m15ClosedIndex, bbSlopeM15Price, bbWidthM15, false);
+        if (!passed) {
+          recordBlockedSignal(bollinger.trendM15, i, side, currentPrice);
+          bollingerBlocked = true;
+        }
+      }
+
+      if (bbSidewayM15) {
+        bollinger.sidewayM15.checks++;
+        const detected = isBollingerSideway(m15Candles, m15ClosedIndex, bbSidewaySlopeM15Price, bbSidewayWidthM15);
+        if (detected) {
+          recordBlockedSignal(bollinger.sidewayM15, i, side, currentPrice);
+          bollingerBlocked = true;
+        }
+      }
+
+      if (bbTrendM1) {
+        bollinger.trendM1.checks++;
+        // IMPORTANT: M1 is evaluated against the M1 candle series and M1 threshold, never M15.
+        const passed = isBollingerTrend(candles, m1Index, bbSlopeM1Price, bbWidthM1, true);
+        if (!passed) {
+          recordBlockedSignal(bollinger.trendM1, i, side, currentPrice);
+          bollingerBlocked = true;
+        }
+      }
+
+      if (bbSidewayM1) {
+        bollinger.sidewayM1.checks++;
+        // Sideway M1 also uses M1 SMA20 delta and M1 BB width/threshold only.
+        const detected = isBollingerSideway(candles, m1Index, bbSidewaySlopeM1Price, bbSidewayWidthM1);
+        if (detected) {
+          recordBlockedSignal(bollinger.sidewayM1, i, side, currentPrice);
+          bollingerBlocked = true;
+        }
+      }
+
+      if (bollingerBlocked) {
         noTrade++;
         continue;
       }
@@ -2140,6 +2197,13 @@ const antiFomo = runCfg.antiFomo;
       if (maxDrawdown > Math.abs(balance - initialBalance || 1) * 0.8) advice.push(`Drawdown $${maxDrawdown.toFixed(2)} khá lớn so với P/L cuối kỳ. Nên ưu tiên kiểm tra BE/Trailing/AI Exit trước khi thay đổi MA.`);
       if (sideway.blocked) advice.push(`Sideway đã BLOCK ${sideway.blocked}/${sideway.checks} case (${(sideway.blocked / sideway.checks * 100).toFixed(1)}%). Counterfactual: đúng ${sideway.correct}, sai ${sideway.wrong}, chưa kết luận ${sideway.unknown}.`);
       if (sideway.checks && sideway.blocked === 0) advice.push('Sideway có kiểm tra nhưng chưa BLOCK tín hiệu nào trong mẫu này; chưa có cơ sở để thay đổi filter.');
+      const bollingerStats = [
+        ['Trend M15', bollinger.trendM15], ['Sideway M15', bollinger.sidewayM15],
+        ['Trend M1', bollinger.trendM1], ['Sideway M1', bollinger.sidewayM1],
+      ] as const;
+      for (const [label, stat] of bollingerStats) {
+        if (stat.checks > 0) advice.push(`Bollinger ${label}: BLOCK ${stat.blocked}/${stat.checks} (${(stat.blocked / stat.checks * 100).toFixed(1)}%). Counterfactual: đúng ${stat.correct}, sai ${stat.wrong}, chưa kết luận ${stat.unknown}.`);
+      }
       if (fomo.blocked) advice.push(`Anti FOMO đã loại ${fomo.blocked}/${fomo.checks} case (${(fomo.blocked / fomo.checks * 100).toFixed(1)}%). Counterfactual: đúng ${fomo.correct}, sai ${fomo.wrong}, chưa kết luận ${fomo.unknown}.`);
       if (aiProfitExit) {
         if (aiExitStat.closes) advice.push(`AI Profit Exit đã CLOSE ${aiExitStat.closes} lệnh chủ động; hãy xem Trade History để đánh giá các EXIT này trước khi quyết định tắt/bật.`);
@@ -2156,7 +2220,7 @@ const antiFomo = runCfg.antiFomo;
     const currentConfigText = configLabel(runCfg);
 
     const finalStats: BacktestStats = {
-      sideway, fomo, session, friday, totalSignals: crosses.length, acceptedSignals,
+      sideway, bollinger, fomo, session, friday, totalSignals: crosses.length, acceptedSignals,
       marketEntries, limitEntries, noTrade, advice, sessionAdvisor, aiExit: aiExitStat,
     };
     const nextRecommendations = makeRecommendations(runCfg, finalStats, result, balance - initialBalance, maxDrawdown);
@@ -2319,20 +2383,52 @@ async function start() {
 
             <label className="switch-row">
               <input type="checkbox" checked={bbTrendM15} onChange={(e) => setBbTrendM15(e.target.checked)} />
-              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M15</strong><small>SMA20 dốc &gt; 50 pip, BB mở rộng, độ rộng &gt; 10</small></span>
+              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M15</strong><small>PASS khi đồng thời: độ dốc SMA20 M15 vượt ngưỡng, giá đóng đúng phía SMA20, BB mở rộng và độ rộng BB vượt ngưỡng. Không đạt đủ = trend yếu, BLOCK.</small></span>
             </label>
+            <div className="bollinger-thresholds" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10, margin: '0 0 12px 42px' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Độ dốc SMA20 M15 (pip)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="1" value={bbSlopeM15Pips} onChange={(e) => setBbSlopeM15Pips(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Độ rộng BB M15 (giá)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="0.1" value={bbWidthM15} onChange={(e) => setBbWidthM15(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+            </div>
             <label className="switch-row">
               <input type="checkbox" checked={bbSidewayM15} onChange={(e) => setBbSidewayM15(e.target.checked)} />
-              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M15</strong><small>SMA20 dốc &lt; 50 pip, độ rộng BB &lt; 10</small></span>
+              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M15</strong><small>BLOCK chỉ khi đồng thời: độ dốc SMA20 M15 dưới ngưỡng, BB co hẹp và giá đóng ngược hướng SMA20. Thiếu bất kỳ điều kiện nào = không xác định Sideway, PASS.</small></span>
             </label>
+            <div className="bollinger-thresholds" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10, margin: '0 0 12px 42px' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Sideway: độ dốc SMA20 M15 (pip)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="1" value={bbSidewaySlopeM15Pips} onChange={(e) => setBbSidewaySlopeM15Pips(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Sideway: độ rộng BB M15 (giá)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="0.1" value={bbSidewayWidthM15} onChange={(e) => setBbSidewayWidthM15(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+            </div>
             <label className="switch-row">
               <input type="checkbox" checked={bbTrendM1} onChange={(e) => setBbTrendM1(e.target.checked)} />
-              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M1</strong><small>SMA20 dốc &gt; 20 pip, BB mở rộng, độ rộng &gt; 4</small></span>
+              <span className="switch" /><span className="switch-content"><strong>Trend mạnh — Bollinger M1</strong><small>PASS khi đồng thời: độ dốc SMA20 M1 vượt ngưỡng M1, giá đóng đúng phía SMA20, BB mở rộng, nến [2] xác nhận và thân nến [2] ≥ 70%. Không đạt đủ = trend yếu, BLOCK.</small></span>
             </label>
+            <div className="bollinger-thresholds" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10, margin: '0 0 12px 42px' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Độ dốc SMA20 M1 (pip)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="1" value={bbSlopeM1Pips} onChange={(e) => setBbSlopeM1Pips(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Độ rộng BB M1 (giá)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="0.1" value={bbWidthM1} onChange={(e) => setBbWidthM1(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+            </div>
             <label className="switch-row">
               <input type="checkbox" checked={bbSidewayM1} onChange={(e) => setBbSidewayM1(e.target.checked)} />
-              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M1</strong><small>SMA20 dốc &lt; 20 pip, độ rộng BB &lt; 4</small></span>
+              <span className="switch" /><span className="switch-content"><strong>Sideway — Bollinger M1</strong><small>BLOCK chỉ khi đồng thời: độ dốc SMA20 M1 dưới ngưỡng M1, BB co hẹp và giá đóng ngược hướng SMA20. Thiếu bất kỳ điều kiện nào = không xác định Sideway, PASS.</small></span>
             </label>
+            <div className="bollinger-thresholds" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10, margin: '0 0 12px 42px' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Sideway: độ dốc SMA20 M1 (pip)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="1" value={bbSidewaySlopeM1Pips} onChange={(e) => setBbSidewaySlopeM1Pips(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11 }}>Sideway: độ rộng BB M1 (giá)
+                <input style={{ width: '100%', minWidth: 0, boxSizing: 'border-box' }} type="number" min="0" step="0.1" value={bbSidewayWidthM1} onChange={(e) => setBbSidewayWidthM1(Math.max(0, Number(e.target.value) || 0))} />
+              </label>
+            </div>
 
             <label className="switch-row">
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
@@ -2583,7 +2679,7 @@ async function start() {
           <div className="panel effectiveness-panel">
             <div className="panel-title">FILTER EFFECTIVENESS & CONFIG ADVISOR</div>
             <div className="effect-grid">
-              {[['SIDEWAY',backtestStats.sideway],['ANTI FOMO',backtestStats.fomo],['SESSION',backtestStats.session],['FRIDAY LOCK',backtestStats.friday]].map(([name,st]:any)=>{
+              {[['SIDEWAY',backtestStats.sideway],['BOLLINGER TREND M15',backtestStats.bollinger.trendM15],['BOLLINGER SIDEWAY M15',backtestStats.bollinger.sidewayM15],['BOLLINGER TREND M1',backtestStats.bollinger.trendM1],['BOLLINGER SIDEWAY M1',backtestStats.bollinger.sidewayM1],['ANTI FOMO',backtestStats.fomo],['SESSION',backtestStats.session],['FRIDAY LOCK',backtestStats.friday]].map(([name,st]:any)=>{
                 const blockRate = st.checks > 0 ? (st.blocked / st.checks) * 100 : null;
                 const precision = st.blocked > 0 ? (st.correct / st.blocked) * 100 : null;
                 return (
@@ -2630,6 +2726,12 @@ async function start() {
                       <button className="recommendation-run" disabled={botRunning} onClick={() => {
                         setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(true);
                         setSideway1Filter(r.config.sideway1Filter);
+                        setBbTrendM15(r.config.bbTrendM15); setBbSidewayM15(r.config.bbSidewayM15);
+                        setBbTrendM1(r.config.bbTrendM1); setBbSidewayM1(r.config.bbSidewayM1);
+                        setBbSlopeM15Pips(r.config.bbSlopeM15Pips); setBbWidthM15(r.config.bbWidthM15);
+                        setBbSlopeM1Pips(r.config.bbSlopeM1Pips); setBbWidthM1(r.config.bbWidthM1);
+                        setBbSidewaySlopeM15Pips(r.config.bbSidewaySlopeM15Pips); setBbSidewayWidthM15(r.config.bbSidewayWidthM15);
+                        setBbSidewaySlopeM1Pips(r.config.bbSidewaySlopeM1Pips); setBbSidewayWidthM1(r.config.bbSidewayWidthM1);
 setSideway2Filter(false); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
                         setAiProfitExit(r.config.aiProfitExit); setFridayLock(r.config.fridayLock); setUseLotChain(r.config.useLotChain);
                         setBaseLot(r.config.baseLot); setUseTradingSession(r.config.useTradingSession); setSessionFrom(r.config.sessionFrom); setSessionTo(r.config.sessionTo);
