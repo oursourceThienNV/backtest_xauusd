@@ -35,12 +35,11 @@ type RunConfig = {
   strategyMode: 'ma' | 'bollinger';
   fast: number; slow: number; trend: number; maTrendEnabled: boolean;
   sideway1Filter: boolean;
-  sideway2Filter: boolean;
   bbTrendM15: boolean; bbSidewayM15: boolean; bbTrendM1: boolean; bbSidewayM1: boolean;
   bbSlopeM15Pips: number; bbWidthM15: number; bbSlopeM1Pips: number; bbWidthM1: number;
   bbSidewaySlopeM15Pips: number; bbSidewayWidthM15: number; bbSidewaySlopeM1Pips: number; bbSidewayWidthM1: number;
-  antiFomo: boolean; breakEven: boolean; trailing: boolean;
-  aiProfitExit: boolean; fridayLock: boolean; useLotChain: boolean;
+  antiFomo: boolean; rrRisk: number; rrReward: number;
+  breakEven: boolean; trailing: boolean; fridayLock: boolean; useLotChain: boolean;
   lotChain: number[]; baseLot: number; useTradingSession: boolean;
   sessionFrom: string; sessionTo: string;
 };
@@ -61,6 +60,7 @@ type ConfigRecommendation = {
 
 type BacktestStats = {
   sideway: FilterStat;
+  maTrend: FilterStat;
   bollinger: { trendM15: FilterStat; sidewayM15: FilterStat; trendM1: FilterStat; sidewayM1: FilterStat };
   fomo: FilterStat;
   session: FilterStat;
@@ -68,48 +68,58 @@ type BacktestStats = {
   totalSignals: number;
   acceptedSignals: number;
   marketEntries: number;
-  limitEntries: number;
+  skippedOpen: number;
   noTrade: number;
   advice: string[];
   sessionAdvisor: { bestWindow: string; bestHour: string; bestPnl: number; bestWinRate: number; trades: number; recommendation: string; };
-  aiExit: {
-    enabled: boolean;
-    closes: number;
-    holds: number;
-    protects: number;
-    averageScore: number;
-    averageProfit: number;
-  };
 };
 
 const emptyFilterStat = (): FilterStat => ({ checks: 0, blocked: 0, correct: 0, wrong: 0, unknown: 0, skippedCandlePower: 0 });
 
-const emptyAiExitStat = () => ({ enabled: false, closes: 0, holds: 0, protects: 0, averageScore: 0, averageProfit: 0 });
 const emptySessionAdvisor = () => ({ bestWindow: '—', bestHour: '—', bestPnl: 0, bestWinRate: 0, trades: 0, recommendation: 'Chưa đủ dữ liệu để đưa ra khuyến nghị.' });
 
-const bodyPower = (candles: any[], index: number) => {
-  if (index < 20) return 0;
-  const current = Math.abs(Number(candles[index].close) - Number(candles[index].open));
-  const avg = candles.slice(index - 20, index).reduce((sum, c) => sum + Math.abs(Number(c.close) - Number(c.open)), 0) / 20;
-  return avg > 0 ? current / avg : 0;
-};
+// ============================================================
+// HẰNG SỐ — KHỚP VỚI BOT LIVE (decision_engine.py / bollinger_engine.py)
+// ============================================================
+const SIDEWAY_RANGE = 3;        // ±3 giá
+const FOMO_MULTIPLIER = 2;      // 200%
+const FOMO_BODY_LOOKBACK = 3;   // 3 nến trước nến Cross
+const SL_LOOKBACK = 10;         // 10 nến trước nến tín hiệu
+const SL_BUFFER = 0.1;          // 0.1 giá
+const SL_MAX_DISTANCE = 10;     // SL tối đa 10 giá so với Entry
+const BB_RR_REWARD = 0.9;       // Bollinger: TP = 1 : 0.9
 
-const candleColor = (c: any) => Number(c.close) > Number(c.open) ? 'GREEN' : Number(c.close) < Number(c.open) ? 'RED' : 'DOJI';
-
+/**
+ * SMA giống pandas close.rolling(period).mean() của bot live.
+ * Các nến chưa đủ `period` vẫn có giá trị trung bình tích lũy để vẽ chart,
+ * nhưng được đánh dấu *_ready = false và KHÔNG dùng để tạo/lọc tín hiệu
+ * (live: rolling trả NaN ở vùng này).
+ */
 function calcIndicators(candles: any[], fast: number, slow: number, trend: number) {
   const out = candles.map((c) => ({ ...c }));
-  // Match decision_engine: pandas close.ewm(span=period, adjust=False).mean().
-  const ema = (period: number) => {
-    const alpha = 2 / (period + 1);
-    let value: number | null = null;
-    return out.map((c) => {
-      const close = Number(c.close);
-      value = value === null ? close : alpha * close + (1 - alpha) * value;
-      return value;
-    });
+  const closes = out.map((c) => Number(c.close));
+  const sma = (periodRaw: number) => {
+    const period = Math.max(1, Math.floor(Number(periodRaw) || 0));
+    const values: number[] = [];
+    const ready: boolean[] = [];
+    let sum = 0;
+    for (let i = 0; i < closes.length; i++) {
+      sum += closes[i];
+      if (i >= period) sum -= closes[i - period];
+      const count = Math.min(i + 1, period);
+      values.push(sum / count);
+      ready.push(i >= period - 1);
+    }
+    return { values, ready };
   };
-  const ef = ema(fast), es = ema(slow), mt = ema(trend);
-  return out.map((c, i) => ({ ...c, ema_fast: ef[i], ema_slow: es[i], ma_trend: mt[i], ma_fast: ef[i], ma_slow: es[i], ema_trend: mt[i] }));
+  const f = sma(fast), s = sma(slow), t = sma(trend);
+  return out.map((c, i) => ({
+    ...c,
+    // Tên cột giữ nguyên như live (ema_fast/ema_slow/ma_trend) nhưng giá trị là SMA.
+    ema_fast: f.values[i], ema_slow: s.values[i], ma_trend: t.values[i],
+    ma_fast: f.values[i], ma_slow: s.values[i], ema_trend: t.values[i],
+    fast_ready: f.ready[i], slow_ready: s.ready[i], trend_ready: t.ready[i],
+  }));
 }
 
 
@@ -245,7 +255,7 @@ function isBollingerSideway(
 }
 
 // Phương pháp 2: tạo tín hiệu riêng theo công thức Trend mạnh M1; độ dốc dùng SMA20_M1[1] - SMA20_M1[2].
-// Không sử dụng EMA cross/EMA trend của Phương pháp 1.
+// Không sử dụng MA Cross / SMA Trend của Phương pháp 1.
 function detectBollingerSignals(candles: any[]) {
   const signals: any[] = [];
 
@@ -296,1216 +306,159 @@ function detectBollingerSignals(candles: any[]) {
   return signals;
 }
 
+// MA Cross: so 2 nến đã đóng liền nhau (giống detect_cross của live).
+// Giá Cross = Close của nến Cross. Chỉ xét khi SMA Fast/Slow đã đủ dữ liệu.
 function detectCrosses(candles: any[]) {
   const crosses: any[] = [];
   for (let i = 1; i < candles.length; i++) {
     const p = candles[i - 1], c = candles[i];
-    if (Number(p.ema_fast) < Number(p.ema_slow) && Number(c.ema_fast) > Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close), type: 'BUY_CROSS' });
-    if (Number(p.ema_fast) > Number(p.ema_slow) && Number(c.ema_fast) < Number(c.ema_slow)) crosses.push({ index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close), type: 'SELL_CROSS' });
+    if (!p.fast_ready || !p.slow_ready || !c.fast_ready || !c.slow_ready) continue;
+    const pf = Number(p.ema_fast), ps = Number(p.ema_slow), cf = Number(c.ema_fast), cs = Number(c.ema_slow);
+    if (![pf, ps, cf, cs].every(Number.isFinite)) continue;
+    const base = { index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''), price: Number(c.close) };
+    if (pf < ps && cf > cs) crosses.push({ ...base, type: 'BUY_CROSS' });
+    else if (pf > ps && cf < cs) crosses.push({ ...base, type: 'SELL_CROSS' });
   }
   return crosses;
 }
 
 /**
- * Giá bình quân 10 nến đã đóng trước nến tín hiệu.
- * Chỉ áp dụng làm giá vào lệnh cho Bollinger; không tham gia tạo tín hiệu.
- * MA Cross tiếp tục dùng nguyên giá vào lệnh hiện có (giá đóng cửa nến cross).
+ * BƯỚC 2.1 — FOMO (giống check_fomo của live)
+ *   BUY : CrossPrice − Low nến Cross
+ *   SELL: High nến Cross − CrossPrice
+ *   > 200% × trung bình |Close − Open| của 3 nến trước nến Cross → BLOCK.
  */
-function averageCloseOfPrevious10Candles(candles: any[], index: number): number | null {
-  const lookback = 10;
-  if (!Array.isArray(candles) || index < lookback || index > candles.length) return null;
-
-  // Không bao gồm nến tín hiệu hiện tại để tránh dùng dữ liệu ngoài cửa sổ.
-  const previousCandles = candles.slice(index - lookback, index);
-  if (previousCandles.length !== lookback) return null;
-
-  const closes = previousCandles.map(c => Number(c.close));
-  if (!closes.every(Number.isFinite)) return null;
-
-  return closes.reduce((sum, value) => sum + value, 0) / lookback;
+function checkFomo(candles: any[], i: number, crossPrice: number, side: 'BUY' | 'SELL') {
+  if (i < FOMO_BODY_LOOKBACK) return { pass: false, distance: 0, avgBody: 0, threshold: 0, reason: 'Không đủ nến' };
+  const candle = candles[i];
+  const previous = candles.slice(i - FOMO_BODY_LOOKBACK, i);
+  const bodies = previous.map((c) => Math.abs(Number(c.close) - Number(c.open)));
+  if (!bodies.every(Number.isFinite)) return { pass: false, distance: 0, avgBody: 0, threshold: 0, reason: 'Dữ liệu nến lỗi' };
+  const avgBody = bodies.reduce((a, b) => a + b, 0) / FOMO_BODY_LOOKBACK;
+  const distance = side === 'BUY' ? crossPrice - Number(candle.low) : Number(candle.high) - crossPrice;
+  const threshold = avgBody * FOMO_MULTIPLIER;
+  const pass = distance <= threshold;
+  return {
+    pass, distance, avgBody, threshold,
+    reason: pass ? 'Khoảng cách trong giới hạn' : 'Khoảng cách > 200% thân nến TB 3 nến trước',
+  };
 }
-
-// Phương pháp Bollinger độc lập với MA Cross.
-// Bước 1: detectBollingerSignals xác nhận 2 nến cùng phía SMA20; nến tín hiệu có thân >= 70%.
-// Bước 2: chỉ những filter Bollinger được bật mới được quyền chặn tín hiệu.
-// Khi tất cả filter đều OFF, tín hiệu hợp lệ đi tiếp vào logic vào lệnh.
-function fomoTh2(candles: any[], i: number, crossPrice: number, side: 'BUY'|'SELL') {
-  if (i < 3) return false;
-  const cs = candles.slice(i - 3, i);
-  const avgHigh = cs.reduce((s,c)=>s+Number(c.high),0)/3;
-  const avgLow = cs.reduce((s,c)=>s+Number(c.low),0)/3;
-  const avgRange = Math.abs(avgHigh-avgLow);
-  const distance = side === 'BUY' ? Math.abs(crossPrice-Math.min(...cs.map(c=>Number(c.low)))) : Math.abs(crossPrice-Math.max(...cs.map(c=>Number(c.high))));
-  return distance > 0 && avgRange < distance * 2;
-}
-
-// function fomoTh3(candles: any[], i: number, side: 'BUY'|'SELL') {
-//   if (i < 2) return { pass:false, decision:null, limitPrice:null };
-//   const cs = [candles[i-2], candles[i-1], candles[i]];
-//   const colors = cs.map(candleColor);
-//   if (colors.includes('DOJI')) return { pass:false, decision:null, limitPrice:null };
-//   const needed = side === 'BUY' ? 'GREEN' : 'RED';
-//   const pass = colors.every(c => c === needed);
-//   return { pass, decision: pass ? `${side}_LIMIT` : null, limitPrice: pass ? (Number(candles[i-1].high)+Number(candles[i-1].low))/2 : null };
-// }
-
-function atrValue(candles: any[], index: number, period = 14) {
-  if (index < 1) return 0;
-  const start = Math.max(1, index - period + 1);
-  let total = 0;
-  let count = 0;
-  for (let i = start; i <= index; i++) {
-    const high = Number(candles[i].high);
-    const low = Number(candles[i].low);
-    const prevClose = Number(candles[i - 1].close);
-    total += Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
-    count++;
-  }
-  return count ? total / count : 0;
-}
-
-function rsiValue(candles: any[], index: number, period = 14) {
-  if (index < period) return 50;
-  let gains = 0, losses = 0;
-  const start = index - period + 1;
-  for (let i = start; i <= index; i++) {
-    const diff = Number(candles[i].close) - Number(candles[i - 1].close);
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
-  }
-  if (losses === 0) return gains > 0 ? 100 : 50;
-  const rs = gains / losses;
-  return 100 - 100 / (1 + rs);
-}
-
-type AiProfitExitResult = {
-  action: 'HOLD' | 'PROTECT' | 'CLOSE';
-  score: number;
-  reasons: string[];
-};
 
 /**
- * Adaptive profit-exit engine.
- * The user only enables/disables it. Internal weights/thresholds are deliberately
- * hidden from the UI and can be optimized during backtest.
+ * BƯỚC 2.2 — SIDEWAY (giống check_sideway của live). Vi phạm 1 trong 2 → BLOCK.
+ *   TH1: |CrossPrice − CrossPrice của lệnh thua trước đó trong chuỗi| ≤ 3 (chỉ khi LossStreak ≥ 1)
+ *   TH2: |Entry − MA Trend| ≤ 3
  */
-function buildAiFeatures(
-  candles: any[],
-  index: number,
-  side: 'BUY' | 'SELL',
-  entryPrice: number,
-  currentPrice: number,
-  tpPrice: number
+function checkSideway(
+  crossPrice: number,
+  entry: number,
+  ma: number | null,
+  lossStreak: number,
+  lastLossCrossPrice: number | null,
 ) {
-  const c = candles[index];
-
-  const atr = atrValue(candles, index);
-
-  const profit =
-    side === 'BUY'
-      ? currentPrice - entryPrice
-      : entryPrice - currentPrice;
-
-  const tpDistance = Math.abs(tpPrice - entryPrice);
-
-  const profitPct =
-    tpDistance > 0
-      ? profit / tpDistance
-      : 0;
-
-  const ema = (period: number, end: number) => {
-    const start = Math.max(0, end - period * 4);
-
-    let value = Number(candles[start].close);
-
-    const alpha = 2 / (period + 1);
-
-    for (let i = start + 1; i <= end; i++) {
-      value =
-        alpha * Number(candles[i].close) +
-        (1 - alpha) * value;
-    }
-
-    return value;
-  };
-
-  const ema9 = ema(9, index);
-  const ema21 = ema(21, index);
-  const ema9Prev = ema(9, index - 1);
-  const ema21Prev = ema(21, index - 1);
-
-  const emaGap =
-    side === 'BUY'
-      ? ema9 - ema21
-      : ema21 - ema9;
-
-  const emaGapChange =
-    side === 'BUY'
-      ? (ema9 - ema21) -
-        (ema9Prev - ema21Prev)
-      : (ema21 - ema9) -
-        (ema21Prev - ema9Prev);
-
-  const body =
-    Math.abs(
-      Number(c.close) -
-      Number(c.open)
-    );
-
-  const range =
-    Math.max(
-      Number(c.high) -
-      Number(c.low),
-      0.00000001
-    );
-
-  const closeLocation =
-    (Number(c.close) -
-      Number(c.low)) /
-    range;
-
-  const upperWick =
-    Number(c.high) -
-    Math.max(
-      Number(c.open),
-      Number(c.close)
-    );
-
-  const lowerWick =
-    Math.min(
-      Number(c.open),
-      Number(c.close)
-    ) -
-    Number(c.low);
-
-  const momentum3 =
-    side === 'BUY'
-      ? Number(c.close) -
-        Number(candles[Math.max(0, index - 3)].close)
-      : Number(candles[Math.max(0, index - 3)].close) -
-        Number(c.close);
-
-  const momentum5 =
-    side === 'BUY'
-      ? Number(c.close) -
-        Number(candles[Math.max(0, index - 5)].close)
-      : Number(candles[Math.max(0, index - 5)].close) -
-        Number(c.close);
-
-  return {
-    profitPct,
-
-    profitAtr:
-      atr > 0
-        ? profit / atr
-        : 0,
-
-    emaGapAtr:
-      atr > 0
-        ? emaGap / atr
-        : 0,
-
-    emaGapChangeAtr:
-      atr > 0
-        ? emaGapChange / atr
-        : 0,
-
-    momentum3Atr:
-      atr > 0
-        ? momentum3 / atr
-        : 0,
-
-    momentum5Atr:
-      atr > 0
-        ? momentum5 / atr
-        : 0,
-
-    bodyAtr:
-      atr > 0
-        ? body / atr
-        : 0,
-
-    bodyRatio:
-      body / range,
-
-    closeLocation,
-
-    upperWickRatio:
-      upperWick / range,
-
-    lowerWickRatio:
-      lowerWick / range,
-
-    rangeAtr:
-      atr > 0
-        ? range / atr
-        : 0,
-  };
+  let th1Block = false;
+  let th1Detail = 'Bỏ qua (chưa có lệnh thua trong chuỗi)';
+  if (lossStreak >= 1 && lastLossCrossPrice !== null) {
+    const gap = Math.abs(crossPrice - lastLossCrossPrice);
+    th1Block = gap <= SIDEWAY_RANGE;
+    th1Detail = `Cross ${crossPrice.toFixed(2)} vs Cross thua ${lastLossCrossPrice.toFixed(2)} (lệch ${gap.toFixed(2)})`;
+  }
+  let th2Block = false;
+  let th2Detail = 'MA Trend chưa có';
+  if (ma !== null) {
+    const gap = Math.abs(entry - ma);
+    th2Block = gap <= SIDEWAY_RANGE;
+    th2Detail = `Entry ${entry.toFixed(2)} vs MA Trend ${ma.toFixed(2)} (lệch ${gap.toFixed(2)})`;
+  }
+  return { pass: !(th1Block || th2Block), th1Block, th1Detail, th2Block, th2Detail };
 }
-function aiProfitExitDecision(
-  candles: any[],
-  index: number,
-  side: 'BUY' | 'SELL',
-  entryPrice: number,
-  currentPrice: number,
-  tpPrice?: number,
-): AiProfitExitResult {
-  const HOLD = (
-    score: number,
-    reasons: string[],
-  ): AiProfitExitResult => ({
-    action: 'HOLD',
-    score,
-    reasons,
-  });
-
-  const PROTECT = (
-    score: number,
-    reasons: string[],
-  ): AiProfitExitResult => ({
-    action: 'PROTECT',
-    score,
-    reasons,
-  });
-
-  const CLOSE = (
-    score: number,
-    reasons: string[],
-  ): AiProfitExitResult => ({
-    action: 'CLOSE',
-    score,
-    reasons,
-  });
-
-  // ============================================================
-  // 1. BASIC VALIDATION
-  // ============================================================
-
-  if (
-    !candles ||
-    index < 30 ||
-    index >= candles.length
-  ) {
-    return HOLD(0, ['Chưa đủ dữ liệu']);
-  }
-
-  const current = candles[index];
-  const prev = candles[index - 1];
-  const prev2 = candles[index - 2];
-  const prev3 = candles[index - 3];
-
-  if (
-    !current ||
-    !prev ||
-    !prev2 ||
-    !prev3
-  ) {
-    return HOLD(0, ['Thiếu candle']);
-  }
-
-  const direction =
-    side === 'BUY'
-      ? 1
-      : -1;
-
-  const price = Number(currentPrice);
-
-  const profit =
-    (price - entryPrice) *
-    direction;
-
-  /*
-   * AI Profit Exit chỉ xử lý lệnh đang lời.
-   */
-  if (
-    !Number.isFinite(profit) ||
-    profit <= 0
-  ) {
-    return HOLD(0, ['Chưa có profit']);
-  }
-
-  // ============================================================
-  // 2. PROFIT PROGRESS
-  // ============================================================
-
-  let profitProgress = 0;
-
-  if (
-    tpPrice !== undefined &&
-    Number.isFinite(tpPrice)
-  ) {
-    const tpDistance =
-      Math.abs(
-        tpPrice - entryPrice,
-      );
-
-    if (tpDistance > 0) {
-      profitProgress =
-        profit / tpDistance;
-    }
-  }
-
-  /*
-   * Nếu không có TP thì dùng ATR làm fallback.
-   */
-  if (
-    profitProgress <= 0
-  ) {
-    const atrFallback =
-      atrValue(candles, index);
-
-    if (
-      Number.isFinite(atrFallback) &&
-      atrFallback > 0
-    ) {
-      profitProgress =
-        profit /
-        (atrFallback * 1.5);
-    }
-  }
-
-  /*
-   * Dưới 40% TP:
-   *
-   * Không cho AI đóng.
-   *
-   * Mục tiêu là tránh AI bị noise M1 đánh bật.
-   */
-  if (profitProgress < 0.40) {
-    return HOLD(
-      0,
-      [
-        `Profit ${Math.round(
-          profitProgress * 100,
-        )}% TP`,
-        'Profit chưa đủ để AI can thiệp',
-      ],
-    );
-  }
-
-  // ============================================================
-  // 3. ATR
-  // ============================================================
-
-  const atr =
-    atrValue(candles, index);
-
-  if (
-    !Number.isFinite(atr) ||
-    atr <= 0
-  ) {
-    return HOLD(
-      0,
-      ['ATR không hợp lệ'],
-    );
-  }
-
-  // ============================================================
-  // 4. CURRENT CANDLE
-  // ============================================================
-
-  const open =
-    Number(current.open);
-
-  const high =
-    Number(current.high);
-
-  const low =
-    Number(current.low);
-
-  const close =
-    Number(current.close);
-
-  const prevOpen =
-    Number(prev.open);
-
-  const prevHigh =
-    Number(prev.high);
-
-  const prevLow =
-    Number(prev.low);
-
-  const prevClose =
-    Number(prev.close);
-
-  const prev2Close =
-    Number(prev2.close);
-
-  const range =
-    Math.max(
-      high - low,
-      0.00000001,
-    );
-
-  const prevRange =
-    Math.max(
-      prevHigh - prevLow,
-      0.00000001,
-    );
-
-  const body =
-    Math.abs(
-      close - open,
-    );
-
-  const prevBody =
-    Math.abs(
-      prevClose - prevOpen,
-    );
-
-  const bodyRatio =
-    body / range;
-
-  const closeLocation =
-    (close - low) /
-    range;
-
-  const upperWick =
-    high -
-    Math.max(
-      open,
-      close,
-    );
-
-  const lowerWick =
-    Math.min(
-      open,
-      close,
-    ) -
-    low;
-
-  const upperWickRatio =
-    upperWick / range;
-
-  const lowerWickRatio =
-    lowerWick / range;
-
-  // ============================================================
-  // 5. EMA
-  //
-  // Dùng EMA đã được calcIndicators() tạo sẵn.
-  // Không gọi emaValue().
-  // ============================================================
-
-  const emaFast =
-    Number(
-      current.ema_fast ??
-      current.ma_fast ??
-      current.close,
-    );
-
-  const emaSlow =
-    Number(
-      current.ema_slow ??
-      current.ma_slow ??
-      current.close,
-    );
-
-  const emaFastPrev =
-    Number(
-      prev.ema_fast ??
-      prev.ma_fast ??
-      prev.close,
-    );
-
-  const emaSlowPrev =
-    Number(
-      prev.ema_slow ??
-      prev.ma_slow ??
-      prev.close,
-    );
-
-  const emaFastPast =
-    Number(
-      candles[index - 3].ema_fast ??
-      candles[index - 3].ma_fast ??
-      candles[index - 3].close,
-    );
-
-  const emaSlowPast =
-    Number(
-      candles[index - 3].ema_slow ??
-      candles[index - 3].ma_slow ??
-      candles[index - 3].close,
-    );
-
-  const emaGap =
-    (emaFast - emaSlow) *
-    direction;
-
-  const prevEmaGap =
-    (emaFastPrev - emaSlowPrev) *
-    direction;
-
-  const pastEmaGap =
-    (emaFastPast - emaSlowPast) *
-    direction;
-
-  /*
-   * EMA vẫn còn đúng hướng.
-   */
-  const emaStillAligned =
-    emaGap > 0;
-
-  /*
-   * EMA gap giảm mạnh.
-   */
-  const emaGapCollapse =
-    prevEmaGap > 0 &&
-    emaGap > 0 &&
-    emaGap <
-      prevEmaGap * 0.50;
-
-  /*
-   * EMA thực sự cross ngược.
-   */
-  const emaReversal =
-    emaGap < 0;
-
-  /*
-   * EMA slope đảo hướng mạnh.
-   */
-  const emaSlope =
-    (
-      (emaFast - emaFastPast) *
-      direction
-    ) / 3;
-
-  const strongEmaSlopeReversal =
-    emaSlope <
-    -atr * 0.08;
-
-  // ============================================================
-  // 6. MOMENTUM
-  // ============================================================
-
-  const close3 =
-    Number(
-      candles[index - 3].close,
-    );
-
-  const close5 =
-    Number(
-      candles[index - 5].close,
-    );
-
-  const close6 =
-    Number(
-      candles[index - 6].close,
-    );
-
-  const close10 =
-    Number(
-      candles[index - 10].close,
-    );
-
-  const momentum3 =
-    (
-      close -
-      close3
-    ) * direction;
-
-  const momentum5 =
-    (
-      close -
-      close5
-    ) * direction;
-
-  const momentum6 =
-    (
-      close -
-      close6
-    ) * direction;
-
-  const momentum10 =
-    (
-      close -
-      close10
-    ) * direction;
-
-  const momentum3Atr =
-    momentum3 / atr;
-
-  const momentum5Atr =
-    momentum5 / atr;
-
-  const momentum6Atr =
-    momentum6 / atr;
-
-  const momentum10Atr =
-    momentum10 / atr;
-
-  /*
-   * Momentum đảo chiều mạnh.
-   */
-  const strongMomentumReversal =
-    momentum3Atr <= -0.20 ||
-    momentum6Atr <= -0.30;
-
-  /*
-   * Momentum đảo chiều cực mạnh.
-   */
-  const extremeMomentumReversal =
-    momentum3Atr <= -0.30 ||
-    momentum5Atr <= -0.35 ||
-    momentum6Atr <= -0.45 ||
-    momentum10Atr <= -0.55;
-
-  // ============================================================
-  // 7. CANDLE POWER
-  // ============================================================
-
-  const cp =
-    bodyPower(
-      candles,
-      index,
-    );
-
-  /*
-   * Nến ngược hướng position.
-   */
-  const reversalCandle =
-    side === 'BUY'
-      ? close < open
-      : close > open;
-
-  /*
-   * Nến đảo chiều mạnh.
-   */
-  const strongReversalCandle =
-    reversalCandle &&
-    cp >= 1.30 &&
-    bodyRatio >= 0.55;
-
-  /*
-   * Nến đảo chiều cực mạnh.
-   */
-  const extremeReversalCandle =
-    reversalCandle &&
-    cp >= 1.70 &&
-    bodyRatio >= 0.65;
-
-  /*
-   * Range expansion.
-   */
-  const rangeExpansion =
-    range >=
-    prevRange * 1.20;
-
-  // ============================================================
-  // 8. STRUCTURE BREAK
-  // ============================================================
-
-  const previousLowest =
-    Math.min(
-      Number(prev.low),
-      Number(prev2.low),
-      Number(prev3.low),
-    );
-
-  const previousHighest =
-    Math.max(
-      Number(prev.high),
-      Number(prev2.high),
-      Number(prev3.high),
-    );
-
-  /*
-   * BUY:
-   * close phá low.
-   *
-   * SELL:
-   * close phá high.
-   */
-  const structureBreak =
-    side === 'BUY'
-      ? close < previousLowest
-      : close > previousHighest;
-
-  const strongStructureBreak =
-    structureBreak &&
-    bodyRatio >= 0.55 &&
-    rangeExpansion;
-
-  // ============================================================
-  // 9. PRICE MOMENTUM REVERSAL
-  // ============================================================
-
-  const previousMove =
-    (
-      prevClose -
-      prev2Close
-    ) * direction;
-
-  const currentMove =
-    (
-      close -
-      prevClose
-    ) * direction;
-
-  /*
-   * Candle trước còn đi đúng hướng,
-   * candle hiện tại quay ngược.
-   */
-  const priceReversal =
-    previousMove > 0 &&
-    currentMove < 0;
-
-  const strongPriceReversal =
-    currentMove <=
-    -atr * 0.15;
-
-  // ============================================================
-  // 10. WICK REJECTION
-  // ============================================================
-
-  /*
-   * BUY:
-   * upper wick lớn => bị reject ở đỉnh.
-   *
-   * SELL:
-   * lower wick lớn => bị reject ở đáy.
-   */
-  const strongRejection =
-    side === 'BUY'
-      ? upperWickRatio >= 0.50
-      : lowerWickRatio >= 0.50;
-
-  // ============================================================
-  // 11. RSI
-  //
-  // RSI KHÔNG được phép tự mình CLOSE.
-  // Chỉ dùng confirmation.
-  // ============================================================
-
-  const rsi =
-    rsiValue(
-      candles,
-      index,
-    );
-
-  const rsiPrev =
-    rsiValue(
-      candles,
-      index - 1,
-    );
-
-  const rsiExtreme =
-    side === 'BUY'
-      ? rsi >= 80
-      : rsi <= 20;
-
-  const rsiTurning =
-    side === 'BUY'
-      ? rsi < rsiPrev
-      : rsi > rsiPrev;
-
-  const strongRsiReversal =
-    rsiExtreme &&
-    rsiTurning;
-
-  // ============================================================
-  // 12. BUILD EXTREME REVERSAL SCORE
-  //
-  // Không phải score để "đoán".
-  //
-  // Score chỉ dùng để xác nhận nhiều tín hiệu cực mạnh
-  // cùng xuất hiện.
-  // ============================================================
-
-  let extremeScore = 0;
-
-  const reversalReasons: string[] = [];
-
-  if (emaReversal) {
-    extremeScore += 4;
-    reversalReasons.push(
-      'EMA9/21 cross ngược',
-    );
-  }
-
-  if (strongEmaSlopeReversal) {
-    extremeScore += 3;
-    reversalReasons.push(
-      'EMA slope đảo chiều mạnh',
-    );
-  }
-
-  if (emaGapCollapse) {
-    extremeScore += 2;
-    reversalReasons.push(
-      'EMA gap collapse',
-    );
-  }
-
-  if (strongMomentumReversal) {
-    extremeScore += 5;
-    reversalReasons.push(
-      'Momentum reversal mạnh',
-    );
-  }
-
-  if (extremeMomentumReversal) {
-    extremeScore += 5;
-    reversalReasons.push(
-      'Momentum reversal cực mạnh',
-    );
-  }
-
-  if (strongReversalCandle) {
-    extremeScore += 4;
-    reversalReasons.push(
-      'Candle reversal mạnh',
-    );
-  }
-
-  if (extremeReversalCandle) {
-    extremeScore += 5;
-    reversalReasons.push(
-      'Candle reversal cực mạnh',
-    );
-  }
-
-  if (structureBreak) {
-    extremeScore += 4;
-    reversalReasons.push(
-      'Break structure',
-    );
-  }
-
-  if (strongStructureBreak) {
-    extremeScore += 4;
-    reversalReasons.push(
-      'Break structure mạnh',
-    );
-  }
-
-  if (strongPriceReversal) {
-    extremeScore += 3;
-    reversalReasons.push(
-      'Price reversal mạnh',
-    );
-  }
-
-  if (strongRejection) {
-    extremeScore += 2;
-    reversalReasons.push(
-      'Strong rejection',
-    );
-  }
-
-  if (strongRsiReversal) {
-    extremeScore += 2;
-    reversalReasons.push(
-      'RSI extreme + turning',
-    );
-  }
-
-  // ============================================================
-  // 13. EXTREME REVERSAL
-  // ============================================================
-
-  /*
-   * CỰC QUAN TRỌNG:
-   *
-   * Không CLOSE chỉ vì score cao.
-   *
-   * Phải có ít nhất 1 trong các "hard trigger":
-   *
-   * A. Structure break mạnh
-   * B. Momentum cực mạnh
-   * C. Candle cực mạnh + momentum
-   * D. EMA cross + momentum
-   */
-
-  const hardStructureTrigger =
-    strongStructureBreak &&
-    (
-      strongMomentumReversal ||
-      strongReversalCandle ||
-      extremeMomentumReversal
-    );
-
-  const hardMomentumTrigger =
-    extremeMomentumReversal &&
-    (
-      structureBreak ||
-      strongReversalCandle ||
-      strongEmaSlopeReversal
-    );
-
-  const hardCandleTrigger =
-    extremeReversalCandle &&
-    (
-      strongMomentumReversal ||
-      structureBreak
-    );
-
-  const hardEmaTrigger =
-    emaReversal &&
-    (
-      strongMomentumReversal ||
-      strongStructureBreak ||
-      extremeReversalCandle
-    );
-
-  const extremeReversal =
-    hardStructureTrigger ||
-    hardMomentumTrigger ||
-    hardCandleTrigger ||
-    hardEmaTrigger;
-
-  // ============================================================
-  // 14. MINIMUM PROFIT FOR EXTREME REVERSAL
-  // ============================================================
-
-  /*
-   * Không cắt những lệnh mới lời tí.
-   *
-   * Muốn AI emergency exit thì phải:
-   *
-   * >= 60% TP
-   *
-   * hoặc profit >= 0.5 ATR.
-   */
-  const enoughProfit =
-    profitProgress >= 0.60 ||
-    profit >= atr * 0.50;
-
-  // ============================================================
-  // 15. EMERGENCY EXTREME REVERSAL
-  // ============================================================
-
-  if (
-    enoughProfit &&
-    extremeReversal
-  ) {
-    return CLOSE(
-      Math.max(
-        extremeScore,
-        10,
-      ),
-      [
-        `EMERGENCY REVERSAL`,
-        `Profit ${Math.round(
-          profitProgress * 100,
-        )}% TP`,
-        ...reversalReasons.slice(
-          0,
-          5,
-        ),
-      ],
-    );
-  }
-
-  // ============================================================
-  // 16. PROFIT COLLAPSE
-  //
-  // Phần này cần dữ liệu MFE từ caller.
-  //
-  // Nếu chưa truyền MFE:
-  // không tự đoán.
-  // ============================================================
-
-  /*
-   * aiProfitExitDecision hiện tại chưa biết maxProfit của trade.
-   *
-   * Caller sẽ truyền qua property tạm thời:
-   *
-   * (open as any).maxProfitDistance
-   *
-   * Nhưng để hàm vẫn tương thích với code cũ,
-   * lấy giá trị optional từ open không thể làm ở đây.
-   *
-   * Vì vậy phần collapse sẽ được xử lý ở managePosition().
-   */
-
-  // ============================================================
-  // 17. NORMAL REVERSAL
-  //
-  // Normal reversal KHÔNG CLOSE.
-  //
-  // Đây là thay đổi quan trọng.
-  // ============================================================
-
-  if (
-    strongMomentumReversal ||
-    strongReversalCandle ||
-    structureBreak ||
-    emaReversal
-  ) {
-    return PROTECT(
-      Math.max(
-        extremeScore,
-        1,
-      ),
-      [
-        `Profit ${Math.round(
-          profitProgress * 100,
-        )}% TP`,
-        'Có reversal nhưng chưa đủ cực mạnh',
-        ...reversalReasons.slice(
-          0,
-          4,
-        ),
-      ],
-    );
-  }
-
-  // ============================================================
-  // 18. TREND HEALTHY
-  //
-  // Trend vẫn khỏe => HOLD.
-  // ============================================================
-
-  const trendHealthy =
-    emaStillAligned &&
-    !emaGapCollapse &&
-    !strongMomentumReversal &&
-    !strongPriceReversal;
-
-  if (trendHealthy) {
-    return HOLD(
-      0,
-      [
-        `Profit ${Math.round(
-          profitProgress * 100,
-        )}% TP`,
-        'Trend vẫn khỏe',
-      ],
-    );
-  }
-
-  // ============================================================
-  // 19. DEFAULT
-  // ============================================================
-
-  return HOLD(
-    Math.max(
-      extremeScore,
-      0,
-    ),
-    [
-      `Profit ${Math.round(
-        profitProgress * 100,
-      )}% TP`,
-      'Không có extreme reversal',
-    ],
-  );
-}
+/**
+ * SL/TP — dùng 10 nến đã đóng TRƯỚC nến tín hiệu (không gồm nến tín hiệu).
+ *
+ * MA Cross (decision_engine.calculate_sl_tp):
+ *   BUY : khoảng SL = Entry − (Low thấp nhất + 0.1)
+ *   SELL: khoảng SL = (High cao nhất − 0.1) − Entry
+ *   Khoảng SL ≤ 0 → không vào lệnh. Khoảng SL tối đa 10 giá. TP = khoảng SL × (RR reward / RR risk).
+ *
+ * Bollinger (bollinger_engine.calculate_sl_tp):
+ *   BUY : SL = max(Low thấp nhất − 0.1, Entry − 10)
+ *   SELL: SL = min(High cao nhất + 0.1, Entry + 10)
+ *   TP = khoảng SL × 0.9.
+ */
 function calculateSlTp(
   candles: any[],
   index: number,
   side: 'BUY' | 'SELL',
   entry: number,
+  method: 'ma' | 'bollinger',
+  rr: number,
 ) {
-  // Dùng đúng quy tắc quản lý rủi ro chung như MA Cross: phân tích 10 nến đã đóng
-  // trước nến vào lệnh để xác định vùng cấu trúc SL; không dùng nến tín hiệu tương lai.
-  // Lưu ý: đây là cấu trúc min(low)/max(high) của 10 nến, không phải trung bình cộng giá đóng cửa.
-  // Khoảng SL tối đa: 8.0 đơn vị giá; đệm ngoài đỉnh/đáy: 0.1 đơn vị giá.
-  const rr = 0.9;
-  const lookback = 10;
-  const buffer = 0.1;
-  const maxSlDistance = 8;
+  if (index < SL_LOOKBACK || !Number.isFinite(entry) || entry <= 0) return null;
 
-  if (index < lookback || !Number.isFinite(entry) || entry <= 0) {
-    return null;
-  }
+  const previous = candles.slice(index - SL_LOOKBACK, index);
+  const lows = previous.map((c) => Number(c.low)).filter(Number.isFinite);
+  const highs = previous.map((c) => Number(c.high)).filter(Number.isFinite);
+  if (lows.length !== SL_LOOKBACK || highs.length !== SL_LOOKBACK) return null;
 
-  // Chỉ lấy 10 nến trước đó, không bao gồm nến tín hiệu hiện tại.
-  const previousCandles = candles.slice(index - lookback, index);
-  const lows = previousCandles
-    .map((c) => Number(c.low))
-    .filter((v) => Number.isFinite(v));
-  const highs = previousCandles
-    .map((c) => Number(c.high))
-    .filter((v) => Number.isFinite(v));
+  const lowest = Math.min(...lows);
+  const highest = Math.max(...highs);
 
-  if (lows.length !== lookback || highs.length !== lookback) {
-    return null;
-  }
-
-  if (side === 'BUY') {
-    // SL nằm thấp hơn đáy thấp nhất 0.1; không cho khoảng SL vượt quá 8 giá.
-    const structureSl = Math.min(...lows) - buffer;
-    const sl = Math.max(structureSl, entry - maxSlDistance);
-    const risk = entry - sl;
-    if (risk <= 0) return null;
-    return { sl, tp: entry + risk * rr };
-  }
-
-  if (side === 'SELL') {
-    // Đối xứng BUY: SL nằm cao hơn đỉnh cao nhất 0.1; tối đa 8 giá.
-    const structureSl = Math.max(...highs) + buffer;
-    const sl = Math.min(structureSl, entry + maxSlDistance);
+  if (method === 'bollinger') {
+    if (side === 'BUY') {
+      const sl = Math.max(lowest - SL_BUFFER, entry - SL_MAX_DISTANCE);
+      const risk = entry - sl;
+      return risk > 0 ? { sl, tp: entry + risk * BB_RR_REWARD } : null;
+    }
+    const sl = Math.min(highest + SL_BUFFER, entry + SL_MAX_DISTANCE);
     const risk = sl - entry;
-    if (risk <= 0) return null;
-    return { sl, tp: entry - risk * rr };
+    return risk > 0 ? { sl, tp: entry - risk * BB_RR_REWARD } : null;
   }
 
-  return null;
+  // MA Cross
+  if (!(rr > 0)) return null;
+  let distance = side === 'BUY'
+    ? entry - (lowest + SL_BUFFER)
+    : (highest - SL_BUFFER) - entry;
+  if (!(distance > 0)) return null;
+  distance = Math.min(distance, SL_MAX_DISTANCE);
+  const tpDistance = distance * rr;
+  if (!(tpDistance > 0)) return null;
+  return side === 'BUY'
+    ? { sl: entry - distance, tp: entry + tpDistance }
+    : { sl: entry + distance, tp: entry - tpDistance };
 }
 
 function favorableMove(side: 'BUY'|'SELL', from: number, to: number) {
   return (to - from) * (side === 'BUY' ? 1 : -1);
 }
 
+/**
+ * Đánh giá "nếu không chặn thì sao" cho tín hiệu bị filter chặn.
+ * Dùng đúng SL/TP của phương pháp; bot live chỉ thoát lệnh bằng SL/TP
+ * (không đóng khi có tín hiệu ngược) nên ở đây cũng chỉ xét SL/TP.
+ */
 function hypotheticalBlockedOutcome(
   candles: any[],
-  crossByIndex: Map<number, any>,
   start: number,
   side: 'BUY' | 'SELL',
   entry: number,
+  method: 'ma' | 'bollinger',
+  rr: number,
 ): 'WIN' | 'LOSS' | 'UNKNOWN' {
-  // A blocked signal is evaluated counterfactually using the same deterministic
-  // SL/TP model as the real backtest.
-  const sltp = calculateSlTp(candles, start, side, entry);
+  const sltp = calculateSlTp(candles, start, side, entry, method, rr);
+  if (!sltp) return 'UNKNOWN';
 
-  if (!sltp) {
-    return 'UNKNOWN';
-  }
-
-  for (let j = start + 1; j < Math.min(candles.length, start + 31); j++) {
+  const horizon = Math.min(candles.length, start + 1 + 24 * 60);
+  for (let j = start + 1; j < horizon; j++) {
     const c = candles[j];
     const low = Number(c.low);
     const high = Number(c.high);
-
-    const slHit =
-      side === 'BUY'
-        ? low <= sltp.sl
-        : high >= sltp.sl;
-
-    const tpHit =
-      side === 'BUY'
-        ? high >= sltp.tp
-        : low <= sltp.tp;
-
-    // Same conservative rule as the real engine:
-    // if both are touched on the same M1 candle, assume SL happened first.
-    if (slHit && tpHit) return 'LOSS';
+    const slHit = side === 'BUY' ? low <= sltp.sl : high >= sltp.sl;
+    const tpHit = side === 'BUY' ? high >= sltp.tp : low <= sltp.tp;
+    // Cùng 1 nến chạm cả SL và TP → giả định SL trước (bảo thủ).
     if (slHit) return 'LOSS';
     if (tpHit) return 'WIN';
-
-    // Close on opposite MA cross when no SL/TP exit happened first.
-    const cross = crossByIndex.get(j);
-
-    if (cross) {
-      const crossSide: 'BUY' | 'SELL' =
-        cross.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
-
-      if (crossSide !== side) {
-        const exit = Number(cross.price);
-        const pnlMove =
-          (exit - entry) * (side === 'BUY' ? 1 : -1);
-
-        if (pnlMove > 0) return 'WIN';
-        if (pnlMove < 0) return 'LOSS';
-
-        return 'UNKNOWN';
-      }
-    }
   }
-
   return 'UNKNOWN';
 }
 
@@ -1555,11 +508,11 @@ export default function Backtest() {
   const [speed, setSpeed] = useState(1);
 
   // Filters - match Trend UI config names.
-  // Sideway 1: lọc vùng giá ±3 USD
-const [sideway1Filter, setSideway1Filter] = useState(false);
-
-// Legacy compatibility only: Candle Power filter has been removed and remains disabled.
-const [sideway2Filter, setSideway2Filter] = useState(false);
+  // Sideway MA Cross: TH1 ±3 so với Cross của lệnh thua trước + TH2 ±3 so với MA Trend.
+  const [sideway1Filter, setSideway1Filter] = useState(false);
+  // R:R của MA Cross (giống ô Risk : Reward trên bot live). Bollinger cố định 1 : 0.9.
+  const [rrRisk, setRrRisk] = useState(1);
+  const [rrReward, setRrReward] = useState(0.9);
   const [bbTrendM15, setBbTrendM15] = useState(false);
   const [bbSidewayM15, setBbSidewayM15] = useState(false);
   const [bbTrendM1, setBbTrendM1] = useState(false);
@@ -1577,10 +530,9 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [chartTimeframe, setChartTimeframe] = useState<'M1'|'M15'>('M1');
   const [antiFomo, setAntiFomo] = useState(false);
 
-  // Position management.
-  const [breakEven, setBreakEven] = useState(true);
-  const [trailing, setTrailing] = useState(true);
-  const [aiProfitExit, setAiProfitExit] = useState(true);
+  // Position management. BE/Trailing: bot live KHÔNG có → mặc định OFF để backtest giống live.
+  const [breakEven, setBreakEven] = useState(false);
+  const [trailing, setTrailing] = useState(false);
   const [fridayLock, setFridayLock] = useState(false);
 
   // Lot chain.
@@ -1600,7 +552,7 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [signalAudit, setSignalAudit] = useState<SignalAudit[]>([]);
   const [botBalance, setBotBalance] = useState(100000);
-  const [backtestStats, setBacktestStats] = useState<BacktestStats>({ sideway: emptyFilterStat(), bollinger: { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() }, fomo: emptyFilterStat(), session: emptyFilterStat(), friday: emptyFilterStat(), totalSignals: 0, acceptedSignals: 0, marketEntries: 0, limitEntries: 0, noTrade: 0, advice: [], sessionAdvisor: emptySessionAdvisor(), aiExit: emptyAiExitStat() });
+  const [backtestStats, setBacktestStats] = useState<BacktestStats>({ sideway: emptyFilterStat(), maTrend: emptyFilterStat(), bollinger: { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() }, fomo: emptyFilterStat(), session: emptyFilterStat(), friday: emptyFilterStat(), totalSignals: 0, acceptedSignals: 0, marketEntries: 0, skippedOpen: 0, noTrade: 0, advice: [], sessionAdvisor: emptySessionAdvisor() });
   const [recommendations, setRecommendations] = useState<ConfigRecommendation[]>([]);
   const [runHistory, setRunHistory] = useState<Array<{ run: number; config: RunConfig; pnl: number; winRate: number; profitFactor: number; drawdown: number; trades: number }>>([]);
 
@@ -1687,149 +639,168 @@ const [sideway2Filter, setSideway2Filter] = useState(false);
   }
 
   /**
-   * Client-side replay runner. The backend only supplies market/candle data;
-   * all strategy, filters and AI-style profit-exit decisions are simulated here.
-   */
-  /**
    * Run exactly ONE configuration from the UI.
    * There is deliberately NO optimizer and NO automatic config mutation here.
    */
   function getCurrentConfig(): RunConfig {
-   return {
-  strategyMode,
-  fast,
-  slow,
-  trend,
-  maTrendEnabled,
-  sideway1Filter,
-  sideway2Filter,
-  bbTrendM15, bbSidewayM15, bbTrendM1, bbSidewayM1,
-  bbSlopeM15Pips, bbWidthM15, bbSlopeM1Pips, bbWidthM1,
-  bbSidewaySlopeM15Pips, bbSidewayWidthM15, bbSidewaySlopeM1Pips, bbSidewayWidthM1,
-  antiFomo,
-  breakEven,
-  trailing,
-  aiProfitExit,
-  fridayLock,
-  useLotChain,
-  lotChain: [...lotChain],
-  baseLot,
-  useTradingSession,
-  sessionFrom,
-  sessionTo,
-};
+    return {
+      strategyMode,
+      fast,
+      slow,
+      trend,
+      maTrendEnabled,
+      sideway1Filter,
+      bbTrendM15, bbSidewayM15, bbTrendM1, bbSidewayM1,
+      bbSlopeM15Pips, bbWidthM15, bbSlopeM1Pips, bbWidthM1,
+      bbSidewaySlopeM15Pips, bbSidewayWidthM15, bbSidewaySlopeM1Pips, bbSidewayWidthM1,
+      antiFomo,
+      rrRisk,
+      rrReward,
+      breakEven,
+      trailing,
+      fridayLock,
+      useLotChain,
+      lotChain: [...lotChain],
+      baseLot,
+      useTradingSession,
+      sessionFrom,
+      sessionTo,
+    };
   }
 
   function configLabel(c: RunConfig) {
-    return [
-      c.strategyMode === 'ma' ? `Phương pháp 1 · MA ${c.fast}/${c.slow} · EMA Trend ${c.trend}` : 'Phương pháp 2 · Bollinger',
-      c.sideway1Filter ? 'Sideway ±3 ON' : 'Sideway ±3 OFF',
-      c.antiFomo ? 'FOMO TH2 ON' : 'FOMO TH2 OFF',
-      c.breakEven ? 'BE ON' : 'BE OFF', c.trailing ? 'Trailing ON' : 'Trailing OFF',
-      c.aiProfitExit ? 'AI Exit ON' : 'AI Exit OFF', c.fridayLock ? 'Friday ON' : 'Friday OFF',
-      c.useTradingSession ? `Session ${c.sessionFrom}-${c.sessionTo}` : 'Session OFF',
-    ].join(' · ');
+    const parts = c.strategyMode === 'ma'
+      ? [
+          `MA Cross · SMA ${c.fast}/${c.slow} · MA Trend ${c.trend}`,
+          c.maTrendEnabled ? 'Trend ON' : 'Trend OFF',
+          c.antiFomo ? 'FOMO ON' : 'FOMO OFF',
+          c.sideway1Filter ? 'Sideway ON' : 'Sideway OFF',
+          `R:R ${c.rrRisk}:${c.rrReward}`,
+        ]
+      : [
+          'Bollinger',
+          `Trend M15 ${c.bbTrendM15 ? 'ON' : 'OFF'}`,
+          `Sideway M15 ${c.bbSidewayM15 ? 'ON' : 'OFF'}`,
+          `Trend M1 ${c.bbTrendM1 ? 'ON' : 'OFF'}`,
+          `Sideway M1 ${c.bbSidewayM1 ? 'ON' : 'OFF'}`,
+          'R:R 1:0.9',
+        ];
+    if (c.breakEven) parts.push('BE ON (không có trên live)');
+    if (c.trailing) parts.push('Trailing ON (không có trên live)');
+    parts.push(c.fridayLock ? 'Friday ON' : 'Friday OFF');
+    parts.push(c.useTradingSession ? `Session ${c.sessionFrom}-${c.sessionTo}` : 'Session OFF');
+    parts.push(c.useLotChain ? `Lot chain ${c.lotChain.join('/')}` : `Lot ${c.baseLot}`);
+    return parts.join(' · ');
   }
 
-  function makeRecommendations(cfg: RunConfig, stats: BacktestStats, result: Trade[], pnl: number, drawdown: number): ConfigRecommendation[] {
+  function makeRecommendations(cfg: RunConfig, stats: BacktestStats, result: Trade[]): ConfigRecommendation[] {
     const out: ConfigRecommendation[] = [];
     const clone = (patch: Partial<RunConfig>): RunConfig => ({ ...cfg, lotChain: [...cfg.lotChain], ...patch });
     const add = (id: string, title: string, reason: string, expected: string, patch: Partial<RunConfig>) => {
+      if (out.some((x) => x.id === id)) return;
       const next = clone(patch);
       if (configLabel(next) !== configLabel(cfg)) out.push({ id, title, reason, expected, config: next });
     };
+    const precision = (st: FilterStat) => (st.blocked > 0 ? (st.correct / st.blocked) * 100 : null);
 
-    if (result.length === 0) {
-      if (cfg.antiFomo) add('fomo-off', 'Thử tắt Anti FOMO', 'Lần chạy hiện tại không có lệnh hoàn tất và Anti FOMO có thể đang loại quá nhiều tín hiệu.', 'Kiểm tra xem số lệnh có tăng mà chất lượng vẫn giữ được hay không.', { antiFomo: false });
-      if (cfg.sideway1Filter) add('sideway-off', 'Thử tắt Sideway Filter', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn cross sau chuỗi thua.', 'Kiểm chứng riêng tác động của Sideway.', {
-   sideway1Filter: false,
-  sideway2Filter: false,
-});
-    } else {
-      const fomoPrecision = stats.fomo.blocked > 0 ? stats.fomo.correct / stats.fomo.blocked * 100 : null;
-      const sidewayPrecision = stats.sideway.blocked > 0 ? stats.sideway.correct / stats.sideway.blocked * 100 : null;
+    // BE / Trailing không có trên bot live → luôn ưu tiên đề xuất tắt để kết quả sát live.
+    if (cfg.breakEven || cfg.trailing) {
+      add('live-match', 'Tắt BE/Trailing để giống bot live', 'Bot live chỉ thoát lệnh bằng SL/TP; BE/Trailing làm kết quả backtest khác live.', 'Có kết quả sát với bot thật nhất.', { breakEven: false, trailing: false });
+    }
 
-      if (stats.fomo.blocked >= Math.max(5, Math.ceil(stats.totalSignals * 0.15)) && fomoPrecision !== null && fomoPrecision < 55) {
-        add('fomo-off', 'Thử Anti FOMO = OFF', `Anti FOMO đã BLOCK ${stats.fomo.blocked}/${stats.fomo.checks}. Hiệu quả chặn chỉ ${fomoPrecision.toFixed(1)}% (đúng ${stats.fomo.correct}, sai ${stats.fomo.wrong}).`, 'Kiểm tra xem FOMO có đang loại quá nhiều tín hiệu tốt hay không.', { antiFomo: false });
-      } else if (stats.fomo.blocked >= 5 && fomoPrecision !== null && fomoPrecision >= 70) {
-        add('fomo-keep', 'Giữ Anti FOMO để kiểm chứng thêm', `Anti FOMO BLOCK ${stats.fomo.blocked} case và ${fomoPrecision.toFixed(1)}% số case bị chặn có outcome xấu theo counterfactual.`, 'Chạy lại trên khoảng dữ liệu khác để xác nhận filter không bị overfit.', { antiFomo: true });
-      }
-
-      if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision < 55) {
-        add('sideway-off', 'Thử Sideway = OFF', `Sideway BLOCK ${stats.sideway.blocked}/${stats.sideway.checks}, nhưng hiệu quả chặn chỉ ${sidewayPrecision.toFixed(1)}% (đúng ${stats.sideway.correct}, sai ${stats.sideway.wrong}).`, 'Kiểm tra xem Sideway có đang bỏ lỡ quá nhiều lệnh tốt sau loss streak hay không.', {
-  sideway1Filter: false,
-  sideway2Filter: false,
-});
-      } else if (stats.sideway.blocked >= 5 && sidewayPrecision !== null && sidewayPrecision >= 70) {
-        add('sideway-keep', 'Giữ Sideway để kiểm chứng thêm', `Sideway BLOCK ${stats.sideway.blocked} case và hiệu quả chặn ${sidewayPrecision.toFixed(1)}%.`, 'Chạy trên giai đoạn khác để xác nhận filter thực sự có lợi thế.', {
-  sideway1Filter: true,
-  sideway2Filter: false,
-});
-      }
-      if (cfg.breakEven) {
-        const beTrades = result.filter(t => /Break Even/i.test(t.reason));
-        if (beTrades.length >= 3) add('be-off', 'Thử Break Even = OFF', `${beTrades.length} lệnh bị đóng bởi Break Even trong lần chạy này.`, 'Kiểm tra xem các lệnh BE có thường tiếp tục chạy đúng hướng hay không.', { breakEven: false });
-      }
-      if (cfg.trailing) {
-        const trailingTrades = result.filter(t => /Trailing Stop/i.test(t.reason));
-        if (trailingTrades.length >= 3) add('trailing-off', 'Thử Trailing Stop = OFF', `${trailingTrades.length} lệnh bị đóng bởi Trailing Stop.`, 'Kiểm tra khả năng giữ lệnh lâu hơn thay vì khóa lợi nhuận quá sớm.', { trailing: false });
-      }
-      if (cfg.aiProfitExit && stats.aiExit.closes >= 3) {
-        add('ai-off', 'Thử AI Profit Exit = OFF', `AI Profit Exit đã chủ động đóng ${stats.aiExit.closes} lệnh.`, 'So sánh trực tiếp với SL/TP + BE/Trailing mà không có AI Exit.', { aiProfitExit: false });
-      }
-      if (!cfg.aiProfitExit && pnl > 0 && stats.totalSignals > 20) {
-        add('ai-on', 'Thử AI Profit Exit = ON', 'Lần chạy có đủ số tín hiệu để kiểm tra thêm lớp quản lý profit.', 'Kiểm tra AI Exit có giảm drawdown mà không làm mất quá nhiều profit hay không.', { aiProfitExit: true });
-      }
-      if (cfg.fast === 9 && cfg.slow === 21) {
-        add('ma-10-21', 'Thử MA 10 / 21', 'MA 9/21 là baseline hiện tại; thay đổi Fast MA một bước giúp kiểm chứng độ nhạy của cross.', 'So sánh số false cross và Profit Factor với baseline.', { fast: 10, slow: 21 });
+    if (cfg.strategyMode === 'ma') {
+      const fomoP = precision(stats.fomo);
+      const sidewayP = precision(stats.sideway);
+      if (result.length === 0) {
+        if (cfg.antiFomo) add('fomo-off', 'Thử tắt FOMO', 'Không có lệnh hoàn tất; FOMO có thể đang loại quá nhiều tín hiệu.', 'Kiểm tra số lệnh có tăng mà chất lượng vẫn giữ được.', { antiFomo: false });
+        if (cfg.sideway1Filter) add('sideway-off', 'Thử tắt Sideway', 'Không có lệnh hoàn tất; Sideway có thể đang chặn phần lớn tín hiệu.', 'Kiểm chứng riêng tác động của Sideway.', { sideway1Filter: false });
+        if (cfg.maTrendEnabled) add('trend-off', 'Thử tắt MA Trend', 'Không có lệnh hoàn tất; MA Trend có thể đang chặn phần lớn Cross.', 'Kiểm chứng riêng tác động của MA Trend.', { maTrendEnabled: false });
       } else {
-        add('ma-9-21', 'Thử quay về MA 9 / 21', 'Baseline 9/21 là mốc tham chiếu dễ so sánh với cấu hình hiện tại.', 'Kiểm tra xem thay đổi MA hiện tại có thực sự cải thiện hay chỉ do mẫu dữ liệu.', { fast: 9, slow: 21 });
-      }
-      if (cfg.useTradingSession) {
-        const best = stats.sessionAdvisor.bestWindow;
-        if (best && best !== '—' && best.includes('-')) {
-          const m = best.match(/(\d{2}):00 - (\d{2}):00/);
-          if (m) add('session-best', 'Thử Session theo cửa sổ tốt nhất', `Cửa sổ ${best} có P/L tốt nhất trong chính lần backtest này.`, 'Kiểm chứng session tốt nhất trên cùng tập dữ liệu trước khi dùng live.', { useTradingSession: true, sessionFrom: `${m[1]}:00`, sessionTo: `${m[2]}:00` });
+        if (cfg.antiFomo && stats.fomo.blocked >= 5 && fomoP !== null && fomoP < 55) {
+          add('fomo-off', 'Thử FOMO = OFF', `FOMO chặn ${stats.fomo.blocked}/${stats.fomo.checks}, chỉ ${fomoP.toFixed(1)}% số lệnh bị chặn là lệnh thua.`, 'Kiểm tra FOMO có đang loại nhiều tín hiệu tốt hay không.', { antiFomo: false });
         }
-      } else if (stats.sessionAdvisor.bestWindow !== '—') {
-        const m = stats.sessionAdvisor.bestWindow.match(/(\d{2}):00 - (\d{2}):00/);
-        if (m) add('session-on', 'Thử bật Trading Session', `Dữ liệu cho thấy có cửa sổ ${stats.sessionAdvisor.bestWindow} đáng kiểm tra.`, 'Kiểm tra việc giới hạn giờ giao dịch có giảm drawdown không.', { useTradingSession: true, sessionFrom: `${m[1]}:00`, sessionTo: `${m[2]}:00` });
+        if (!cfg.antiFomo) add('fomo-on', 'Thử FOMO = ON', 'FOMO đang tắt; nên A/B test bộ lọc này.', 'So sánh Win Rate và Profit Factor khi bật FOMO.', { antiFomo: true });
+        if (cfg.sideway1Filter && stats.sideway.blocked >= 5 && sidewayP !== null && sidewayP < 55) {
+          add('sideway-off', 'Thử Sideway = OFF', `Sideway chặn ${stats.sideway.blocked}/${stats.sideway.checks}, chỉ ${sidewayP.toFixed(1)}% số lệnh bị chặn là lệnh thua.`, 'Kiểm tra Sideway có bỏ lỡ nhiều lệnh tốt hay không.', { sideway1Filter: false });
+        }
+        if (!cfg.sideway1Filter) add('sideway-on', 'Thử Sideway = ON', 'Sideway đang tắt; nên A/B test TH1 (±3 Cross thua) và TH2 (±3 MA Trend).', 'So sánh drawdown khi bật Sideway.', { sideway1Filter: true });
+        if (!cfg.maTrendEnabled) add('trend-on', 'Thử MA Trend = ON', 'MA Trend đang tắt; chỉ vào lệnh cùng hướng trend thường giảm lệnh ngược xu hướng.', 'So sánh Win Rate khi bật MA Trend.', { maTrendEnabled: true });
+      }
+    } else {
+      const items: Array<[string, keyof RunConfig, FilterStat, boolean]> = [
+        ['Trend M15', 'bbTrendM15', stats.bollinger.trendM15, cfg.bbTrendM15],
+        ['Sideway M15', 'bbSidewayM15', stats.bollinger.sidewayM15, cfg.bbSidewayM15],
+        ['Trend M1', 'bbTrendM1', stats.bollinger.trendM1, cfg.bbTrendM1],
+        ['Sideway M1', 'bbSidewayM1', stats.bollinger.sidewayM1, cfg.bbSidewayM1],
+      ];
+      for (const [label, key, st, on] of items) {
+        const p = precision(st);
+        if (on && (result.length === 0 || (st.blocked >= 5 && p !== null && p < 55))) {
+          add(`bb-${key}-off`, `Thử ${label} = OFF`, result.length === 0 ? `Không có lệnh hoàn tất; ${label} có thể đang chặn quá nhiều.` : `${label} chặn ${st.blocked}/${st.checks}, chỉ ${p!.toFixed(1)}% lệnh bị chặn là lệnh thua.`, `Kiểm chứng riêng tác động của ${label}.`, { [key]: false } as Partial<RunConfig>);
+        }
+        if (!on && result.length > 0) {
+          add(`bb-${key}-on`, `Thử ${label} = ON`, `${label} đang tắt; nên A/B test bộ lọc này.`, 'So sánh Win Rate và drawdown khi bật.', { [key]: true } as Partial<RunConfig>);
+        }
       }
     }
 
-    // Always give the user actionable next experiments, but never more than 3.
-    if (out.length < 3 && cfg.breakEven && !out.some(x => x.id === 'be-off')) add('be-off-fallback', 'Thử Break Even = OFF', 'BE là biến quản lý vị thế độc lập, phù hợp để kiểm chứng riêng.', 'So sánh profit giữ lại và drawdown.', { breakEven: false });
-    if (out.length < 3 && cfg.trailing && !out.some(x => x.id === 'trailing-off')) add('trailing-off-fallback', 'Thử Trailing Stop = OFF', 'Trailing có thể làm thay đổi điểm thoát mà không ảnh hưởng Entry.', 'Kiểm chứng lợi nhuận giữ lại khi để SL/TP tự nhiên.', { trailing: false });
-    if (out.length < 3 && cfg.aiProfitExit && !out.some(x => x.id === 'ai-off')) add('ai-off-fallback', 'Thử AI Profit Exit = OFF', 'AI Exit là lớp độc lập và nên được A/B test riêng.', 'So sánh tác động của AI Exit với cấu hình hiện tại.', { aiProfitExit: false });
+    const m = stats.sessionAdvisor.bestWindow.match(/(\d{2}):00 - (\d{2}):00/);
+    if (m && stats.sessionAdvisor.bestPnl > 0) {
+      add('session-best', 'Thử Session theo cửa sổ tốt nhất', `Cửa sổ ${stats.sessionAdvisor.bestWindow} có P/L tốt nhất trong lần backtest này.`, 'Kiểm chứng trên khoảng dữ liệu khác trước khi dùng live.', { useTradingSession: true, sessionFrom: `${m[1]}:00`, sessionTo: `${m[2]}:00` });
+    }
     return out.slice(0, 3);
   }
-
+  /**
+   * Client-side replay runner. Backend chỉ cung cấp nến; toàn bộ logic
+   * tín hiệu / filter / SL-TP mô phỏng lại đúng như bot live:
+   *   - MA Cross  : decision_engine.py
+   *   - Bollinger : bollinger_engine.py
+   * Tín hiệu xét trên nến ĐÃ ĐÓNG, vào lệnh MARKET tại giá Close của nến tín hiệu.
+   * Đang có lệnh mở → tín hiệu mới bị bỏ qua (live không mở thêm, không đóng khi có tín hiệu ngược).
+   * Lệnh chỉ thoát bằng SL/TP (BE/Trailing là tùy chọn thử nghiệm, live không có).
+   */
   async function runBot(overrides?: RunConfig) {
     const runCfg = overrides || getCurrentConfig();
     const strategyMode = runCfg.strategyMode || 'ma';
-    const fast = runCfg.fast; const slow = runCfg.slow; const trend = runCfg.trend;
+    const fast = Number(runCfg.fast); const slow = Number(runCfg.slow); const trend = Number(runCfg.trend);
     const maTrendEnabled = runCfg.maTrendEnabled;
-const sideway1Filter = runCfg.sideway1Filter;
-const sideway2Filter = runCfg.sideway2Filter;
-const bbTrendM15 = runCfg.bbTrendM15; const bbSidewayM15 = runCfg.bbSidewayM15;
-const bbTrendM1 = runCfg.bbTrendM1; const bbSidewayM1 = runCfg.bbSidewayM1;
-const bbSlopeM15Pips = Math.max(0, Number(runCfg.bbSlopeM15Pips) || 0);
-const bbWidthM15 = Math.max(0, Number(runCfg.bbWidthM15) || 0);
-const bbSlopeM1Pips = Math.max(0, Number(runCfg.bbSlopeM1Pips) || 0);
-const bbWidthM1 = Math.max(0, Number(runCfg.bbWidthM1) || 0);
-const bbSidewaySlopeM15Price = Math.max(0, Number(runCfg.bbSidewaySlopeM15Pips) || 0) / 10;
-const bbSidewayWidthM15 = Math.max(0, Number(runCfg.bbSidewayWidthM15) || 0);
-const bbSidewaySlopeM1Price = Math.max(0, Number(runCfg.bbSidewaySlopeM1Pips) || 0) / 10;
-const bbSidewayWidthM1 = Math.max(0, Number(runCfg.bbSidewayWidthM1) || 0);
-// Convert pip thresholds to XAUUSD price units independently per timeframe.
-// 50 pip = 5.0 price; 20 pip = 2.0 price. M1 MUST use only bbSlopeM1Price.
-const bbSlopeM15Price = bbSlopeM15Pips / 10;
-const bbSlopeM1Price = bbSlopeM1Pips / 10;
-const antiFomo = runCfg.antiFomo;
-    const breakEven = runCfg.breakEven; const trailing = runCfg.trailing; const aiProfitExit = runCfg.aiProfitExit;
+    const sideway1Filter = runCfg.sideway1Filter;
+    const bbTrendM15 = runCfg.bbTrendM15; const bbSidewayM15 = runCfg.bbSidewayM15;
+    const bbTrendM1 = runCfg.bbTrendM1; const bbSidewayM1 = runCfg.bbSidewayM1;
+    // Ngưỡng độ dốc nhập theo pip: 10 pip = 1.0 giá (XAUUSD).
+    const bbSlopeM15Price = Math.max(0, Number(runCfg.bbSlopeM15Pips) || 0) / 10;
+    const bbWidthM15 = Math.max(0, Number(runCfg.bbWidthM15) || 0);
+    const bbSlopeM1Price = Math.max(0, Number(runCfg.bbSlopeM1Pips) || 0) / 10;
+    const bbWidthM1 = Math.max(0, Number(runCfg.bbWidthM1) || 0);
+    const bbSidewaySlopeM15Price = Math.max(0, Number(runCfg.bbSidewaySlopeM15Pips) || 0) / 10;
+    const bbSidewayWidthM15 = Math.max(0, Number(runCfg.bbSidewayWidthM15) || 0);
+    const bbSidewaySlopeM1Price = Math.max(0, Number(runCfg.bbSidewaySlopeM1Pips) || 0) / 10;
+    const bbSidewayWidthM1 = Math.max(0, Number(runCfg.bbSidewayWidthM1) || 0);
+    const antiFomo = runCfg.antiFomo;
+    const breakEven = runCfg.breakEven; const trailing = runCfg.trailing;
     const fridayLock = runCfg.fridayLock; const useLotChain = runCfg.useLotChain; const lotChain = runCfg.lotChain;
     const baseLot = runCfg.baseLot; const useTradingSession = runCfg.useTradingSession;
     const sessionFrom = runCfg.sessionFrom; const sessionTo = runCfg.sessionTo;
+    const rrRisk = Number(runCfg.rrRisk); const rrReward = Number(runCfg.rrReward);
+    const maRr = rrRisk > 0 && rrReward > 0 ? rrReward / rrRisk : 0;
+    const rrForMethod = strategyMode === 'ma' ? maRr : BB_RR_REWARD;
+
+    if (!data?.candles?.length) {
+      setError('Hãy START REPLAY trước khi chạy bot.');
+      return;
+    }
+
+    // Giống live: cấu hình không hợp lệ → không chạy (không dùng giá trị mặc định ngầm).
+    if (strategyMode === 'ma') {
+      const isPosInt = (v: number) => Number.isInteger(v) && v > 0;
+      if (!isPosInt(fast) || !isPosInt(slow)) { setError('MA Fast / MA Slow phải là số nguyên > 0.'); return; }
+      if (fast >= slow) { setError('MA Fast phải nhỏ hơn MA Slow.'); return; }
+      if ((maTrendEnabled || sideway1Filter) && !isPosInt(trend)) { setError('MA Trend period phải là số nguyên > 0 khi bật MA Trend hoặc Sideway.'); return; }
+      if (!(rrRisk > 0) || !(rrReward > 0)) { setError('R:R phải là số > 0.'); return; }
+    }
+    if (useLotChain && lotChain.length === 0) { setError('Chuỗi lot không hợp lệ.'); return; }
+    if (!useLotChain && !(baseLot > 0)) { setError('Lot phải > 0.'); return; }
+
     const isWithinTradingSession = (candleTime: string) => {
       if (!useTradingSession) return true;
       const parts = parseCandleTime(candleTime);
@@ -1848,15 +819,11 @@ const antiFomo = runCfg.antiFomo;
       const parts = parseCandleTime(candleTime);
       return !!parts && candleWeekday(candleTime) === 5 && parts.hour >= 20;
     };
-    const resolveLot = (lossStreak: number) => {
+    const resolveLot = (streak: number) => {
       if (!useLotChain) return baseLot;
       const chain = lotChain.length ? lotChain : [baseLot];
-      return chain[Math.min(lossStreak, chain.length - 1)];
+      return chain[Math.min(streak, chain.length - 1)];
     };
-    if (!data?.candles?.length) {
-      setError('Hãy START REPLAY trước khi chạy bot.');
-      return;
-    }
 
     setError('');
     setPlaying(false);
@@ -1868,33 +835,27 @@ const antiFomo = runCfg.antiFomo;
     const crosses = strategyMode === 'ma' ? detectCrosses(candles) : detectBollingerSignals(candles);
     const crossByIndex = new Map(crosses.map(x => [x.index, x]));
     const audit: SignalAudit[] = [];
-    const auditByIndex = new Map<number, SignalAudit>();
     const result: Trade[] = [];
     const sideway = emptyFilterStat();
+    const maTrend = emptyFilterStat();
     const bollinger = { trendM15: emptyFilterStat(), sidewayM15: emptyFilterStat(), trendM1: emptyFilterStat(), sidewayM1: emptyFilterStat() };
     const fomo = emptyFilterStat();
     const session = emptyFilterStat();
     const friday = emptyFilterStat();
-    const aiExitStat = emptyAiExitStat();
-    aiExitStat.enabled = aiProfitExit;
 
     let balance = initialBalance;
     let peakBalance = balance;
     let maxDrawdown = 0;
     let lossStreak = 0;
-    let lastLossEntryPrice: number | null = null;
+    let lastLossCrossPrice: number | null = null;
     let open: any = null;
-    let pendingLimit: any = null;
     let tradeId = 1;
     let acceptedSignals = 0;
     let marketEntries = 0;
-    let limitEntries = 0;
     let noTrade = 0;
+    let skippedOpen = 0;
     let grossWin = 0;
     let grossLoss = 0;
-    let aiScoreTotal = 0;
-    let aiScoreSamples = 0;
-    let aiProfitTotal = 0;
 
     const hourStats: Record<number, { trades: number; pnl: number; wins: number }> = {};
     for (let h = 0; h < 24; h++) hourStats[h] = { trades: 0, pnl: 0, wins: 0 };
@@ -1906,7 +867,7 @@ const antiFomo = runCfg.antiFomo;
 
     const recordBlockedSignal = (stat: FilterStat, index: number, side: 'BUY' | 'SELL', entry: number) => {
       stat.blocked++;
-      const outcome = hypotheticalBlockedOutcome(candles, crossByIndex, index, side, entry);
+      const outcome = hypotheticalBlockedOutcome(candles, index, side, entry, strategyMode, rrForMethod);
       if (outcome === 'LOSS') stat.correct++;
       else if (outcome === 'WIN') stat.wrong++;
       else stat.unknown++;
@@ -1921,361 +882,189 @@ const antiFomo = runCfg.antiFomo;
       updateDrawdown();
       if (pnl > 0) grossWin += pnl;
       if (pnl < 0) grossLoss += Math.abs(pnl);
-      const entryParts = parseCandleTime(open.entryCandleTime);
-      const hour = entryParts?.hour ?? 0;
+      const hour = parseCandleTime(open.entryCandleTime)?.hour ?? 0;
       hourStats[hour].trades++;
       hourStats[hour].pnl += pnl;
       if (pnl > 0) hourStats[hour].wins++;
       result.push({
-        id: open.id,
-        side: open.side,
-        entryTime: open.entryTime,
-        entryCandleTime: open.entryCandleTime,
-        entryPrice: open.entryPrice,
-        exitTime,
-        exitCandleTime,
-        exitPrice,
-        lot: open.lot,
-        pnl,
-        result: r,
-        reason,
+        id: open.id, side: open.side,
+        entryTime: open.entryTime, entryCandleTime: open.entryCandleTime, entryPrice: open.entryPrice,
+        exitTime, exitCandleTime, exitPrice,
+        lot: open.lot, pnl, result: r, reason,
       });
-      lossStreak = r === 'LOSS' ? lossStreak + 1 : 0;
+      // Chuỗi thua: lệnh thua → +1 và ghi nhớ giá Cross của lệnh thua (Sideway TH1); lệnh thắng/BE → reset.
       if (r === 'LOSS') {
-        lastLossEntryPrice = open.entryPrice;
+        lossStreak++;
+        lastLossCrossPrice = open.crossPrice;
+      } else {
+        lossStreak = 0;
+        lastLossCrossPrice = null;
       }
       open = null;
     };
 
-    const managePosition = (i: number, c: any) => {
-      if (!open) return false;
-
-      // 1. SL/TP are evaluated from candle OHLC. If both are touched by the same
-      // candle and tick data is unavailable, use the conservative SL-first rule.
+    const managePosition = (c: any) => {
+      if (!open) return;
       const low = Number(c.low), high = Number(c.high);
       const slHit = open.side === 'BUY' ? low <= open.sl : high >= open.sl;
       const tpHit = open.side === 'BUY' ? high >= open.tp : low <= open.tp;
-      if (slHit && tpHit) {
-        closeTrade(Number(c.time), String(c.candle_time), open.sl, 'SL/TP same candle · conservative SL');
-        return true;
-      }
-      if (slHit) {
-        closeTrade(Number(c.time), String(c.candle_time), open.sl, 'Stop Loss');
-        return true;
-      }
-      if (tpHit) {
-        closeTrade(Number(c.time), String(c.candle_time), open.tp, 'Take Profit');
-        return true;
-      }
+      const slReason = open.trailingApplied ? 'Trailing Stop' : open.beApplied ? 'Break Even' : 'Stop Loss';
+      if (slHit && tpHit) { closeTrade(Number(c.time), String(c.candle_time), open.sl, `${slReason} · SL/TP cùng nến (giả định SL trước)`); return; }
+      if (slHit) { closeTrade(Number(c.time), String(c.candle_time), open.sl, slReason); return; }
+      if (tpHit) { closeTrade(Number(c.time), String(c.candle_time), open.tp, 'Take Profit'); return; }
 
+      // Tùy chọn thử nghiệm (bot live KHÔNG có): dời SL sau khi đạt 50% quãng TP, áp dụng từ nến sau.
+      if (!breakEven && !trailing) return;
       const currentPrice = Number(c.close);
-      const totalTpDistance = Math.abs(open.initialTp - open.entryPrice);
-      const currentProfitDistance = favorableMove(open.side, open.entryPrice, currentPrice);
-      const progress = totalTpDistance > 0 ? currentProfitDistance / totalTpDistance : 0;
-
-      // 2. Break Even is independent from Trailing and AI Exit.
-      if (breakEven && progress >= 0.5 && !open.beApplied) {
-        open.sl = open.entryPrice;
+      const tpDistance = Math.abs(open.tp - open.entryPrice);
+      const profit = favorableMove(open.side, open.entryPrice, currentPrice);
+      const progress = tpDistance > 0 ? profit / tpDistance : 0;
+      if (progress < 0.5) return;
+      if (breakEven && !open.beApplied) {
+        open.sl = open.side === 'BUY' ? Math.max(open.sl, open.entryPrice) : Math.min(open.sl, open.entryPrice);
         open.beApplied = true;
       }
-
-      // 3. Trailing is also independent. Match the live engine's 60% lock after 50% TP.
-      if (trailing && progress >= 0.5) {
-        const lockedProfit = currentProfitDistance * 0.6;
-        const newSl = open.side === 'BUY'
-          ? open.entryPrice + lockedProfit
-          : open.entryPrice - lockedProfit;
-        if (open.side === 'BUY') open.sl = Math.max(open.sl, newSl);
-        else open.sl = Math.min(open.sl, newSl);
+      if (trailing) {
+        const lockedSl = open.side === 'BUY' ? open.entryPrice + profit * 0.6 : open.entryPrice - profit * 0.6;
+        open.sl = open.side === 'BUY' ? Math.max(open.sl, lockedSl) : Math.min(open.sl, lockedSl);
         open.trailingApplied = true;
       }
-
-      // Re-check the updated SL on the current candle close. This models a stop
-      // that was moved before the close, without pretending we have tick data.
-      const movedSlHit = open.side === 'BUY' ? low <= open.sl : high >= open.sl;
-      if (movedSlHit) {
-        closeTrade(Number(c.time), String(c.candle_time), open.sl, open.trailingApplied ? 'Trailing Stop' : 'Break Even');
-        return true;
-      }
-
-      // 4. AI Profit Exit is fully independent of BE/Trailing.
-      if (aiProfitExit) {
-        const ai = aiProfitExitDecision(
-                    candles,
-                    i,
-                    open.side,
-                    open.entryPrice,
-                    currentPrice,
-                    open.initialTp
-                  );
-        if (ai.score > 0) {
-          aiScoreTotal += ai.score;
-          aiScoreSamples++;
-        }
-        if (ai.action === 'PROTECT') aiExitStat.protects++;
-        else if (ai.action === 'HOLD') aiExitStat.holds++;
-        if (ai.action === 'CLOSE') {
-          aiExitStat.closes++;
-          aiProfitTotal += Math.max(0, favorableMove(open.side, open.entryPrice, currentPrice) * open.lot * 100);
-          closeTrade(Number(c.time), String(c.candle_time), currentPrice, `AI Profit Exit · Score ${ai.score.toFixed(1)} · ${ai.reasons.slice(0, 2).join(', ') || 'adaptive reversal'}`);
-          return true;
-        }
-      }
-      return false;
     };
 
     for (let i = 0; i < candles.length; i++) {
       if (i > 0 && i % 1000 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
       const c = candles[i];
 
-      // 1) Manage an already open position.
-      if (open) managePosition(i, c);
+      // 1) Quản lý lệnh đang mở trên nến hiện tại.
+      if (open) managePosition(c);
 
-      // 2) A pending BUY_LIMIT / SELL_LIMIT can be filled by later candles.
-      // The pending order stays alive until a NEW strategy signal appears.
-      if (!open && pendingLimit) {
-        const filled = pendingLimit.side === 'BUY'
-          ? Number(c.low) <= pendingLimit.price
-          : Number(c.high) >= pendingLimit.price;
-
-        if (filled) {
-          const sltp = calculateSlTp(
-              candles,
-              i,
-              pendingLimit.side,
-              pendingLimit.price
-            );
-
-            if (!sltp) {
-              pendingLimit = null;
-              continue;
-            }
-
-          if (sltp.sl != null && sltp.tp != null) {
-            open = {
-              id: tradeId++,
-              side: pendingLimit.side,
-              entryTime: Number(c.time),
-              entryCandleTime: String(c.candle_time),
-              entryPrice: pendingLimit.price,
-              lot: resolveLot(lossStreak),
-              crossPrice: pendingLimit.crossPrice,
-              sl: sltp.sl,
-              tp: sltp.tp,
-              initialTp: sltp.tp,
-              beApplied: false,
-              trailingApplied: false,
-              entryType: pendingLimit.decision,
-            };
-            acceptedSignals++;
-            limitEntries++;
-            pendingLimit = null;
-          }
-        }
-      }
-
-      const cross = crossByIndex.get(i);
-      if (!cross) continue;
-      const side: 'BUY'|'SELL' = cross.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
-      const entry = Number(cross.price);
+      const signal = crossByIndex.get(i);
+      if (!signal) continue;
+      const side: 'BUY' | 'SELL' = signal.type === 'BUY_CROSS' ? 'BUY' : 'SELL';
+      const crossPrice = Number(signal.price);
+      // Backtest không có tick: giá MARKET = Close nến tín hiệu (live dùng Ask/Bid ngay sau khi nến đóng).
+      const entry = Number(c.close);
       const auditRow: SignalAudit = {
         index: i, time: Number(c.time), candle_time: String(c.candle_time ?? ''),
-        side, price: entry, status: 'SIGNAL', reason: 'Tín hiệu được tạo theo xác nhận 2 nến SMA20; đang kiểm tra filter.',
+        side, price: crossPrice, status: 'SIGNAL',
+        reason: strategyMode === 'ma' ? `MA Cross SMA${fast} x SMA${slow}` : 'Bollinger: 2 nến cùng phía SMA20, thân nến tín hiệu ≥ 70%',
       };
       audit.push(auditRow);
-      auditByIndex.set(i, auditRow);
-      const blockAudit = (reason: string) => {
+      const block = (stat: FilterStat | null, reason: string) => {
+        if (stat) recordBlockedSignal(stat, i, side, entry);
         auditRow.status = 'BLOCKED';
         auditRow.reason = reason;
+        noTrade++;
       };
 
-      // Evaluate the NEW strategy signal first. A pending LIMIT is NOT cancelled
-      // merely because a cross appeared; it is cancelled/replaced only when the
-      // new cross survives MA/Sideway/FOMO and becomes BUY, SELL, BUY_LIMIT or
-      // SELL_LIMIT.
-
-      // MA Cross và Bollinger đã có signal generator riêng. Sau khi có tín hiệu mới xét filter tương ứng.
-      // Trong backtest, giá đóng cửa nến tín hiệu là giá thị trường khả dụng.
-      const currentPrice = Number(c.close);
-
-      // MA Cross-only filter: FOMO TH2. Bollinger signals must not depend on MA Cross/FOMO.
-      if (strategyMode === 'ma' && antiFomo) {
-        fomo.checks++;
-        const th2 = fomoTh2(candles, i, currentPrice, side);
-        if (!th2) {
-          recordBlockedSignal(fomo, i, side, entry);
-          blockAudit('Anti FOMO TH2');
-          noTrade++;
-          continue;
-        }
+      // 2) Giờ giao dịch / Friday Lock — live không xét tín hiệu ngoài giờ.
+      if (useTradingSession) {
+        session.checks++;
+        if (!isWithinTradingSession(String(c.candle_time))) { block(session, 'Ngoài giờ giao dịch'); continue; }
+      }
+      if (fridayLock) {
+        friday.checks++;
+        if (isFridayLocked(String(c.candle_time))) { block(friday, 'Friday Lock'); continue; }
       }
 
-      // MA Cross-only filter: Sideway compares CURRENT PRICE with the most recent LOSS entry +/- 3.
-      // A later WIN must not erase the previous LOSS reference. Candle Power is not an entry gate.
-      const sidewayEnabled = strategyMode === 'ma' && sideway1Filter;
-
-      // Chỉ Bollinger dùng giá bình quân 10 nến trước tín hiệu làm giá vào lệnh.
-      // Tín hiệu BUY/SELL vẫn lấy nguyên từ detectBollingerSignals; không sửa công thức tín hiệu.
-      // MA Cross giữ nguyên giá vào lệnh là giá đóng cửa nến cross.
-      const bollingerAverageEntry = strategyMode === 'bollinger'
-        ? averageCloseOfPrevious10Candles(candles, i)
-        : null;
-      const finalEntry = strategyMode === 'bollinger'
-        ? (bollingerAverageEntry ?? entry)
-        : entry;
-
-      if (sidewayEnabled && lastLossEntryPrice !== null) {
-        sideway.checks++;
-        const lower = lastLossEntryPrice - 3;
-        const upper = lastLossEntryPrice + 3;
-        if (currentPrice >= lower && currentPrice <= upper) {
-          recordBlockedSignal(sideway, i, side, currentPrice);
-          blockAudit('Sideway ±3');
-          noTrade++;
-          continue;
-        }
-      }
-
-      // Bollinger filters use AND semantics: every enabled filter must pass.
-      // Trend ON => all Trend-strong conditions must pass, otherwise BLOCK (weak/unclear trend).
-      // Sideway ON => BLOCK only when every Sideway condition is true; otherwise it passes.
-      // Evaluate filters independently for per-filter statistics. M15 uses the last
-      // fully closed M15 candle; M1 slope/BB calculations use M1 candles and M1 thresholds only.
-      const m1Index = i;
-      const m15Bucket = Math.floor(Number(c.time) / 900) * 900;
-      const m15Current = m15ByBucket.get(m15Bucket);
-      const m15ClosedIndex = m15Current ? m15Current.index - 1 : -1;
-
-      let bollingerBlocked = false;
-
-      if (strategyMode === 'bollinger' && bbTrendM15) {
-        bollinger.trendM15.checks++;
-        const passed = isBollingerTrend(m15Candles, m15ClosedIndex, bbSlopeM15Price, bbWidthM15, false);
-        if (!passed) {
-          recordBlockedSignal(bollinger.trendM15, i, side, currentPrice);
-          blockAudit('Bollinger Trend M15');
-          bollingerBlocked = true;
-        }
-      }
-
-      if (strategyMode === 'bollinger' && bbSidewayM15) {
-        bollinger.sidewayM15.checks++;
-        const detected = isBollingerSideway(m15Candles, m15ClosedIndex, bbSidewaySlopeM15Price, bbSidewayWidthM15);
-        if (detected) {
-          recordBlockedSignal(bollinger.sidewayM15, i, side, currentPrice);
-          blockAudit('Bollinger Sideway M15');
-          bollingerBlocked = true;
-        }
-      }
-
-      if (strategyMode === 'bollinger' && bbTrendM1) {
-        bollinger.trendM1.checks++;
-        // IMPORTANT: M1 is evaluated against the M1 candle series and M1 threshold, never M15.
-        const passed = isBollingerTrend(candles, m1Index, bbSlopeM1Price, bbWidthM1, true);
-        if (!passed) {
-          recordBlockedSignal(bollinger.trendM1, i, side, currentPrice);
-          blockAudit('Bollinger Trend M1');
-          bollingerBlocked = true;
-        }
-      }
-
-      if (strategyMode === 'bollinger' && bbSidewayM1) {
-        bollinger.sidewayM1.checks++;
-        // Sideway M1 also uses M1 SMA20 delta and M1 BB width/threshold only.
-        const detected = isBollingerSideway(candles, m1Index, bbSidewaySlopeM1Price, bbSidewayWidthM1);
-        if (detected) {
-          recordBlockedSignal(bollinger.sidewayM1, i, side, currentPrice);
-          blockAudit('Bollinger Sideway M1');
-          bollingerBlocked = true;
-        }
-      }
-
-      if (bollingerBlocked) {
-        noTrade++;
-        continue;
-      }
-
-      // STEP 3: EMA trend direction and current-price distance must both agree with Cross.
-      if (strategyMode === 'ma' && maTrendEnabled && trend > 0) {
-        const ma = Number(c.ma_trend);
-        const prevMa = i > 0 ? Number(candles[i - 1].ma_trend) : Number.NaN;
-        if (!Number.isFinite(ma) || !Number.isFinite(prevMa)) {
-          blockAudit('MA Trend: thiếu dữ liệu EMA');
-          noTrade++;
-          continue;
-        }
-        const trendAligned = side === 'BUY' ? ma > prevMa : ma < prevMa;
-        const distancePass = side === 'BUY'
-          ? currentPrice >= ma + 3
-          : currentPrice <= ma - 3;
-        if (!trendAligned || !distancePass) {
-          blockAudit(!trendAligned ? 'MA Trend: EMA không cùng hướng' : 'MA Trend: giá chưa cách EMA Trend đủ 3');
-          noTrade++;
-          continue;
-        }
-      }
-
-      if (useTradingSession) session.checks++;
-      if (fridayLock) friday.checks++;
-      if (!isWithinTradingSession(String(c.candle_time))) {
-        recordBlockedSignal(session, i, side, entry);
-        blockAudit('Trading Session');
-        noTrade++;
-        continue;
-      }
-      if (isFridayLocked(String(c.candle_time))) {
-        recordBlockedSignal(friday, i, side, entry);
-        blockAudit('Friday Lock');
-        noTrade++;
-        continue;
-      }
-
-      // THIS is the replace/cancel rule:
-      // only now, after a real NEW strategy signal has been accepted, remove
-      // the previous pending LIMIT. The new signal can then be MARKET or a new
-      // BUY_LIMIT/SELL_LIMIT which replaces it.
-      if (pendingLimit) {
-        pendingLimit = null;
-      }
-
-      // A valid opposite market/limit signal closes an existing position.
-      if (open && open.side !== side) {
-        closeTrade(Number(c.time), String(c.candle_time), entry, strategyMode === 'ma' ? 'Opposite MA Cross' : 'Opposite Bollinger Signal');
-      }
+      // 3) Đang có lệnh mở → bỏ qua (live không mở thêm, không đóng lệnh khi có tín hiệu ngược).
       if (open) {
         auditRow.status = 'SKIPPED';
-        auditRow.reason = 'Đã có vị thế mở cùng chiều; không mở thêm lệnh.';
+        auditRow.reason = `Đang có lệnh ${open.side} mở; bot không mở thêm.`;
+        skippedOpen++;
         continue;
       }
-      const sltp = calculateSlTp(candles, i, side, finalEntry);
 
-          if (!sltp) {
-            auditRow.status = 'SKIPPED';
-            auditRow.reason = 'Không tính được SL/TP theo dữ liệu cấu trúc.';
+      if (strategyMode === 'ma') {
+        const maValue = c.trend_ready && Number.isFinite(Number(c.ma_trend)) ? Number(c.ma_trend) : null;
+
+        // BƯỚC 1 — TREND: Close nến Cross trên MA Trend = Trend UP, dưới = Trend DOWN.
+        if (maTrendEnabled) {
+          maTrend.checks++;
+          if (maValue === null) { block(maTrend, `MA Trend ${trend}: chưa đủ dữ liệu`); continue; }
+          const close = Number(c.close);
+          const trendDir = close > maValue ? 'UP' : close < maValue ? 'DOWN' : null;
+          const passTrend = (side === 'BUY' && trendDir === 'UP') || (side === 'SELL' && trendDir === 'DOWN');
+          if (!passTrend) { block(maTrend, `MA Trend ${trend}: Cross ngược trend (Close ${close.toFixed(2)} / MA ${maValue.toFixed(2)})`); continue; }
+        }
+
+        // BƯỚC 2.1 — FOMO.
+        if (antiFomo) {
+          fomo.checks++;
+          const f = checkFomo(candles, i, crossPrice, side);
+          if (!f.pass) { block(fomo, `FOMO: ${f.reason} (${f.distance.toFixed(2)} > ${f.threshold.toFixed(2)})`); continue; }
+        }
+
+        // BƯỚC 2.2 — SIDEWAY (TH1 + TH2).
+        if (sideway1Filter) {
+          sideway.checks++;
+          const s = checkSideway(crossPrice, entry, maValue, lossStreak, lastLossCrossPrice);
+          if (!s.pass) {
+            const parts: string[] = [];
+            if (s.th1Block) parts.push(`TH1 ±3 Cross thua: ${s.th1Detail}`);
+            if (s.th2Block) parts.push(`TH2 ±3 MA Trend: ${s.th2Detail}`);
+            block(sideway, `Sideway | ${parts.join(' ; ')}`);
             continue;
           }
+        }
+      } else {
+        // Bollinger filters (AND): Trend bật → phải PASS; Sideway bật → BLOCK khi phát hiện sideway.
+        // M15 dùng nến M15 ĐÃ ĐÓNG gần nhất tại thời điểm nến M1 tín hiệu vừa đóng.
+        const decisionTime = Number(c.time) + 60;
+        const m15Current = m15ByBucket.get(Math.floor(decisionTime / 900) * 900);
+        const m15ClosedIndex = m15Current ? m15Current.index - 1 : m15Candles.length - 1;
+        const blocks: string[] = [];
+        const blockStats: FilterStat[] = [];
 
-          open = {
-            id: tradeId++,
-            side,
-            entryTime: Number(c.time),
-            entryCandleTime: String(c.candle_time),
-            entryPrice: finalEntry,
-            lot: resolveLot(lossStreak),
-            crossPrice: entry,
-            sl: sltp.sl,
-            tp: sltp.tp,
-            initialTp: sltp.tp,
-            beApplied: false,
-            trailingApplied: false,
-            entryType: 'MARKET',
-          };
+        if (bbTrendM15) {
+          bollinger.trendM15.checks++;
+          if (!isBollingerTrend(m15Candles, m15ClosedIndex, bbSlopeM15Price, bbWidthM15, false)) { blocks.push('Trend M15 yếu / không rõ'); blockStats.push(bollinger.trendM15); }
+        }
+        if (bbSidewayM15) {
+          bollinger.sidewayM15.checks++;
+          if (isBollingerSideway(m15Candles, m15ClosedIndex, bbSidewaySlopeM15Price, bbSidewayWidthM15)) { blocks.push('Sideway M15'); blockStats.push(bollinger.sidewayM15); }
+        }
+        if (bbTrendM1) {
+          bollinger.trendM1.checks++;
+          if (!isBollingerTrend(candles, i, bbSlopeM1Price, bbWidthM1, true)) { blocks.push('Trend M1 yếu / không rõ'); blockStats.push(bollinger.trendM1); }
+        }
+        if (bbSidewayM1) {
+          bollinger.sidewayM1.checks++;
+          if (isBollingerSideway(candles, i, bbSidewaySlopeM1Price, bbSidewayWidthM1)) { blocks.push('Sideway M1'); blockStats.push(bollinger.sidewayM1); }
+        }
+        if (blocks.length) {
+          blockStats.forEach((st) => recordBlockedSignal(st, i, side, entry));
+          block(null, `Bollinger BLOCK: ${blocks.join(', ')}`);
+          continue;
+        }
+      }
+
+      // 4) SL / TP theo đúng phương pháp.
+      const sltp = calculateSlTp(candles, i, side, entry, strategyMode, rrForMethod);
+      if (!sltp) {
+        auditRow.status = 'BLOCKED';
+        auditRow.reason = 'SL/TP: giá đã vượt vùng đáy/đỉnh 10 nến trước → không vào lệnh.';
+        noTrade++;
+        continue;
+      }
+
+      open = {
+        id: tradeId++,
+        side,
+        entryTime: Number(c.time),
+        entryCandleTime: String(c.candle_time),
+        entryPrice: entry,
+        lot: resolveLot(lossStreak),
+        crossPrice,
+        sl: sltp.sl,
+        tp: sltp.tp,
+        beApplied: false,
+        trailingApplied: false,
+      };
       acceptedSignals++;
       marketEntries++;
       auditRow.status = 'ENTERED';
-      auditRow.reason = strategyMode === 'bollinger'
-        ? `Đã mở lệnh MARKET theo tín hiệu Bollinger (2 nến cùng phía SMA20, thân nến tín hiệu >= 70%) sau khi vượt qua các filter đang bật. Giá vào lệnh = bình quân Close 10 nến trước: ${finalEntry.toFixed(2)}.`
-        : 'Đã mở lệnh MARKET theo tín hiệu MA Cross sau khi vượt qua các filter đang bật.';
+      auditRow.reason = `MARKET ${side} @ ${entry.toFixed(2)} · SL ${sltp.sl.toFixed(2)} · TP ${sltp.tp.toFixed(2)} · Lot ${open.lot}${useLotChain ? ` (L${Math.min(lossStreak, lotChain.length - 1) + 1})` : ''}`;
     }
 
     if (open) {
@@ -2284,13 +1073,11 @@ const antiFomo = runCfg.antiFomo;
     }
 
     const wins = result.filter(x => x.result === 'WIN').length;
-    const losses = result.filter(x => x.result === 'LOSS').length;
     const total = result.length;
     const wr = total ? wins / total * 100 : 0;
     const pf = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 99 : 0;
 
-    // Session Advisor: analyze the actual completed trades by entry hour. No
-    // alternate configurations are tested here.
+    // Session Advisor: phân tích lệnh đã hoàn tất theo giờ vào lệnh.
     let bestHour = 0;
     let bestHourScore = -Infinity;
     for (let h = 0; h < 24; h++) {
@@ -2314,55 +1101,54 @@ const antiFomo = runCfg.antiFomo;
       return { size, ...best };
     });
     const bestWindow = windows.sort((a,b) => b.pnl - a.pnl)[0];
+    const windowText = bestWindow ? `${String(bestWindow.start).padStart(2,'0')}:00 - ${String((bestWindow.start + bestWindow.size) % 24).padStart(2,'0')}:00` : '—';
     const sessionAdvisor = bestWindow?.trades
       ? {
-          bestWindow: `${String(bestWindow.start).padStart(2,'0')}:00 - ${String((bestWindow.start + bestWindow.size) % 24).padStart(2,'0')}:00`,
+          bestWindow: windowText,
           bestHour: `${String(bestHour).padStart(2,'0')}:00`,
           bestPnl: bestWindow.pnl,
           bestWinRate: bestWindow.trades ? bestWindow.wins / bestWindow.trades * 100 : 0,
           trades: bestWindow.trades,
           recommendation: bestWindow.pnl > 0
-            ? `Nếu muốn thử tối ưu session thủ công, nên ưu tiên kiểm tra ${String(bestWindow.start).padStart(2,'0')}:00 - ${String((bestWindow.start + bestWindow.size) % 24).padStart(2,'0')}:00 vì đây là cửa sổ có P/L lịch sử tốt nhất trong chính lần backtest này.`
+            ? `Nếu muốn thử tối ưu session thủ công, nên kiểm tra ${windowText} vì đây là cửa sổ có P/L tốt nhất trong lần backtest này.`
             : 'Chưa có cửa sổ giờ dương rõ ràng; không nên thay đổi session chỉ dựa trên mẫu dữ liệu này.'
         }
       : emptySessionAdvisor();
 
-    const advice: string[] = [];
-    if (total === 0) advice.push('Không có lệnh hoàn tất. Hãy kiểm tra MA Cross, Session, Sideway và Anti FOMO trong chính cấu hình hiện tại.');
-    else {
-      if (wr < 45) advice.push(`Win Rate hiện tại ${wr.toFixed(1)}%. Nên thử thay đổi từng thông số một, bắt đầu từ filter có tác động lớn nhất thay vì đổi nhiều cấu hình cùng lúc.`);
-      if (pf > 0 && pf < 1) advice.push(`Profit Factor ${pf.toFixed(2)} đang dưới 1. Cấu hình hiện tại chưa có lợi thế rõ ràng trên mẫu dữ liệu này.`);
-      if (pf >= 1.3 && wr >= 50) advice.push(`Cấu hình hiện tại có tín hiệu tích cực: Win Rate ${wr.toFixed(1)}%, Profit Factor ${pf.toFixed(2)}. Nên giữ nguyên làm baseline và chỉ thử thay đổi từng tham số.`);
-      if (maxDrawdown > Math.abs(balance - initialBalance || 1) * 0.8) advice.push(`Drawdown $${maxDrawdown.toFixed(2)} khá lớn so với P/L cuối kỳ. Nên ưu tiên kiểm tra BE/Trailing/AI Exit trước khi thay đổi MA.`);
-      if (sideway.blocked) advice.push(`Sideway đã BLOCK ${sideway.blocked}/${sideway.checks} case (${(sideway.blocked / sideway.checks * 100).toFixed(1)}%). Counterfactual: đúng ${sideway.correct}, sai ${sideway.wrong}, chưa kết luận ${sideway.unknown}.`);
-      if (sideway.checks && sideway.blocked === 0) advice.push('Sideway có kiểm tra nhưng chưa BLOCK tín hiệu nào trong mẫu này; chưa có cơ sở để thay đổi filter.');
-      const bollingerStats = [
-        ['Trend M15', bollinger.trendM15], ['Sideway M15', bollinger.sidewayM15],
-        ['Trend M1', bollinger.trendM1], ['Sideway M1', bollinger.sidewayM1],
-      ] as const;
-      for (const [label, stat] of bollingerStats) {
-        if (stat.checks > 0) advice.push(`Bollinger ${label}: BLOCK ${stat.blocked}/${stat.checks} (${(stat.blocked / stat.checks * 100).toFixed(1)}%). Counterfactual: đúng ${stat.correct}, sai ${stat.wrong}, chưa kết luận ${stat.unknown}.`);
-      }
-      if (fomo.blocked) advice.push(`Anti FOMO đã loại ${fomo.blocked}/${fomo.checks} case (${(fomo.blocked / fomo.checks * 100).toFixed(1)}%). Counterfactual: đúng ${fomo.correct}, sai ${fomo.wrong}, chưa kết luận ${fomo.unknown}.`);
-      if (aiProfitExit) {
-        if (aiExitStat.closes) advice.push(`AI Profit Exit đã CLOSE ${aiExitStat.closes} lệnh chủ động; hãy xem Trade History để đánh giá các EXIT này trước khi quyết định tắt/bật.`);
-        else advice.push('AI Profit Exit đang ON nhưng chưa có CLOSE chủ động đủ rõ trong mẫu; chưa nên kết luận AI Exit có lợi hay hại.');
-      }
-      if (breakEven) advice.push('Break Even đang ON. Nên kiểm tra các lệnh BE trong Trade History trước khi thử OFF; không tự động thay đổi cấu hình.');
-      if (trailing) advice.push('Trailing đang ON và độc lập với AI Exit. Nếu nhiều lệnh bị đóng sớm, có thể thử OFF riêng Trailing ở một lần backtest tiếp theo.');
-      advice.push(sessionAdvisor.recommendation);
-    }
+    const describe = (label: string, st: FilterStat) =>
+      `${label}: chặn ${st.blocked}/${st.checks} (${(st.blocked / st.checks * 100).toFixed(1)}%). Nếu không chặn: ${st.correct} lệnh sẽ thua, ${st.wrong} lệnh sẽ thắng, ${st.unknown} chưa rõ.`;
 
-    aiExitStat.averageScore = aiScoreSamples ? aiScoreTotal / aiScoreSamples : 0;
-    aiExitStat.averageProfit = aiExitStat.closes ? aiProfitTotal / aiExitStat.closes : 0;
+    const advice: string[] = [];
+    if (total === 0) {
+      advice.push(strategyMode === 'ma'
+        ? 'Không có lệnh hoàn tất. Hãy kiểm tra MA Trend, FOMO, Sideway và Session trong cấu hình hiện tại.'
+        : 'Không có lệnh hoàn tất. Hãy kiểm tra các filter Bollinger Trend/Sideway và Session.');
+    } else {
+      if (wr < 45) advice.push(`Win Rate ${wr.toFixed(1)}%. Nên thay đổi từng thông số một, bắt đầu từ filter có tác động lớn nhất.`);
+      if (pf > 0 && pf < 1) advice.push(`Profit Factor ${pf.toFixed(2)} dưới 1 — cấu hình chưa có lợi thế trên mẫu dữ liệu này.`);
+      if (pf >= 1.3 && wr >= 50) advice.push(`Kết quả tích cực: Win Rate ${wr.toFixed(1)}%, Profit Factor ${pf.toFixed(2)}. Giữ làm baseline và chỉ thử thay đổi từng tham số.`);
+      if (useLotChain && maxDrawdown > 0) advice.push(`Đang dùng chuỗi lot ${lotChain.join(' → ')}; Max Drawdown $${maxDrawdown.toFixed(2)}.`);
+    }
+    if (maTrend.checks) advice.push(describe(`MA Trend ${trend}`, maTrend));
+    if (fomo.checks) advice.push(describe('FOMO', fomo));
+    if (sideway.checks) advice.push(describe('Sideway', sideway));
+    for (const [label, st] of [
+      ['Bollinger Trend M15', bollinger.trendM15], ['Bollinger Sideway M15', bollinger.sidewayM15],
+      ['Bollinger Trend M1', bollinger.trendM1], ['Bollinger Sideway M1', bollinger.sidewayM1],
+    ] as const) {
+      if (st.checks) advice.push(describe(label, st));
+    }
+    if (skippedOpen) advice.push(`${skippedOpen} tín hiệu bị bỏ qua vì đang có lệnh mở (giống bot live).`);
+    if (breakEven || trailing) advice.push('⚠ BE/Trailing đang bật nhưng bot live KHÔNG có tính năng này — kết quả sẽ khác live.');
+    if (total > 0) advice.push(sessionAdvisor.recommendation);
 
     const currentConfigText = configLabel(runCfg);
 
     const finalStats: BacktestStats = {
-      sideway, bollinger, fomo, session, friday, totalSignals: crosses.length, acceptedSignals,
-      marketEntries, limitEntries, noTrade, advice, sessionAdvisor, aiExit: aiExitStat,
+      sideway, maTrend, bollinger, fomo, session, friday, totalSignals: crosses.length, acceptedSignals,
+      marketEntries, skippedOpen, noTrade, advice, sessionAdvisor,
     };
-    const nextRecommendations = makeRecommendations(runCfg, finalStats, result, balance - initialBalance, maxDrawdown);
+    const nextRecommendations = makeRecommendations(runCfg, finalStats, result);
     setBacktestStats(finalStats);
     setRecommendations(nextRecommendations);
     setRunHistory(prev => [...prev, { run: prev.length + 1, config: runCfg, pnl: balance - initialBalance, winRate: wr, profitFactor: pf, drawdown: maxDrawdown, trades: result.length }].slice(-20));
@@ -2407,9 +1193,10 @@ async function start() {
         ma_trend: maTrendEnabled,
         sideway_filter: sideway1Filter,
         anti_fomo: antiFomo,
+        rr_risk: rrRisk,
+        rr_reward: rrReward,
         be: breakEven,
         trailing,
-        ai_profit_exit: aiProfitExit,
         friday_lock: fridayLock,
         multi_lot: useLotChain,
         lot_chain: lotChain,
@@ -2473,7 +1260,7 @@ async function start() {
           <div className="section-title">REPLAY SETUP</div>
           <label>Phương pháp giao dịch
             <select value={strategyMode} onChange={(e) => setStrategyMode(e.target.value as 'ma' | 'bollinger')}>
-              <option value="ma">Phương pháp 1 — MA Cross + MA Trend 200</option>
+              <option value="ma">Phương pháp 1 — MA Cross (SMA)</option>
               <option value="bollinger">Phương pháp 2 — Bollinger</option>
             </select>
           </label>
@@ -2499,9 +1286,13 @@ async function start() {
               <label>MA Slow<input type="number" value={slow} onChange={(e) => setSlow(+e.target.value)} /></label>
             </div>
             <label>MA Trend period<input type="number" value={trend} onChange={(e) => setTrend(+e.target.value)} /></label>
+            <div className="two">
+              <label>R:R Risk<input type="number" min="0" step="0.1" value={rrRisk} onChange={(e) => setRrRisk(+e.target.value)} /></label>
+              <label>R:R Reward<input type="number" min="0" step="0.1" value={rrReward} onChange={(e) => setRrReward(+e.target.value)} /></label>
+            </div>
             <label className="switch-row">
               <input type="checkbox" checked={maTrendEnabled} onChange={(e) => setMaTrendEnabled(e.target.checked)} />
-              <span className="switch" /><span className="switch-content"><strong>MA Trend ON/OFF</strong><small>Khi tắt, bỏ lọc hướng và khoảng cách với EMA Trend.</small></span>
+              <span className="switch" /><span className="switch-content"><strong>Bước 1 — MA Trend</strong><small>Close nến Cross trên SMA Trend = Trend UP (chỉ BUY), dưới = Trend DOWN (chỉ SELL).</small></span>
             </label>
           </>}
 
@@ -2516,8 +1307,8 @@ async function start() {
   />
   <span className="switch" />
   <span className="switch-content">
-    <strong>Sideway — Price Range ±3</strong>
-    <small>Trong vùng ±3 USD sau lệnh thua thì BLOCK tín hiệu</small>
+    <strong>Bước 2.2 — Sideway</strong>
+    <small>BLOCK khi: TH1 giá Cross cách Cross của lệnh thua trước ≤ ±3 (khi đang thua chuỗi), hoặc TH2 Entry cách SMA Trend ≤ ±3.</small>
   </span>
 </label>}
 
@@ -2577,8 +1368,8 @@ async function start() {
               <input type="checkbox" checked={antiFomo} onChange={(e) => setAntiFomo(e.target.checked)} />
               <span className="switch" />
               <span className="switch-content">
-                <strong>FOMO TH2</strong>
-                <small>Kiểm tra FOMO TH2 trước khi xét Sideway và EMA Trend</small>
+                <strong>Bước 2.1 — FOMO</strong>
+                <small>BUY: Cross − Low nến Cross; SELL: High − Cross. Lớn hơn 200% thân nến TB 3 nến trước → BLOCK.</small>
               </span>
             </label>}
           </div>
@@ -2590,8 +1381,8 @@ async function start() {
               <input type="checkbox" checked={breakEven} onChange={(e) => setBreakEven(e.target.checked)} />
               <span className="switch" />
               <span className="switch-content">
-                <strong>Break Even</strong>
-                <small>Tự dời SL về Entry</small>
+                <strong>Break Even (thử nghiệm)</strong>
+                <small>Bot live KHÔNG có. Dời SL về Entry khi đạt 50% TP.</small>
               </span>
             </label>
 
@@ -2599,17 +1390,8 @@ async function start() {
               <input type="checkbox" checked={trailing} onChange={(e) => setTrailing(e.target.checked)} />
               <span className="switch" />
               <span className="switch-content">
-                <strong>Trailing Stop</strong>
-                <small>Khóa lợi nhuận</small>
-              </span>
-            </label>
-
-            <label className="switch-row ai-profit-exit-row">
-              <input type="checkbox" checked={aiProfitExit} onChange={(e) => setAiProfitExit(e.target.checked)} />
-              <span className="switch" />
-              <span className="switch-content">
-                <strong>AI Profit Exit</strong>
-                <small>AI tự phân tích và chủ động chốt lời khi xác suất đảo chiều tăng</small>
+                <strong>Trailing Stop (thử nghiệm)</strong>
+                <small>Bot live KHÔNG có. Khóa 60% lợi nhuận khi đạt 50% TP.</small>
               </span>
             </label>
 
@@ -2742,7 +1524,7 @@ async function start() {
 
           <div className="legend">
             {strategyMode === 'ma' ? <>
-              <span><i className="dot orange" />MA Fast</span><span><i className="dot purple" />MA Slow</span><span><i className="dot cyan" />EMA Trend</span>
+              <span><i className="dot orange" />MA Fast</span><span><i className="dot purple" />MA Slow</span><span><i className="dot cyan" />SMA Trend</span>
             </> : <><span><i className="dot orange" />BB Upper</span><span><i className="dot purple" />SMA20</span><span><i className="dot cyan" />BB Lower</span></>}
           </div>
         </aside>
@@ -2794,16 +1576,10 @@ async function start() {
               <div className="market-row"><span>Price</span><b>{candle?.close?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>MA Fast</span><b>{candle?.ma_fast?.toFixed(2) || '—'}</b></div>
               <div className="market-row"><span>MA Slow</span><b>{candle?.ma_slow?.toFixed(2) || '—'}</b></div>
-              <div className="market-row"><span>EMA {trend}</span><b>{candle?.ema_trend?.toFixed(2) || '—'}</b></div>
-<div className="market-row">
-  <span>Sideway 1 — Price Range</span>
-  <b className={sideway1Filter ? 'up' : ''}>
-    {sideway1Filter ? 'ON' : 'OFF'}
-  </b>
-</div>
-
-              <div className="market-row"><span>FOMO TH2</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
-              <div className="market-row"><span>AI Profit Exit</span><b className={aiProfitExit ? 'up' : ''}>{aiProfitExit ? 'ON' : 'OFF'}</b></div>
+              <div className="market-row"><span>SMA {trend}</span><b>{candle?.ema_trend?.toFixed(2) || '—'}</b></div>
+              <div className="market-row"><span>MA Trend</span><b className={maTrendEnabled ? 'up' : ''}>{maTrendEnabled ? 'ON' : 'OFF'}</b></div>
+              <div className="market-row"><span>FOMO</span><b className={antiFomo ? 'up' : ''}>{antiFomo ? 'ON' : 'OFF'}</b></div>
+              <div className="market-row"><span>Sideway TH1 + TH2</span><b className={sideway1Filter ? 'up' : ''}>{sideway1Filter ? 'ON' : 'OFF'}</b></div>
             </div>
 
             <div className="panel">
@@ -2857,7 +1633,7 @@ async function start() {
           <div className="panel effectiveness-panel">
             <div className="panel-title">FILTER EFFECTIVENESS & CONFIG ADVISOR</div>
             <div className="effect-grid">
-              {[['SIDEWAY',backtestStats.sideway],['BOLLINGER TREND M15',backtestStats.bollinger.trendM15],['BOLLINGER SIDEWAY M15',backtestStats.bollinger.sidewayM15],['BOLLINGER TREND M1',backtestStats.bollinger.trendM1],['BOLLINGER SIDEWAY M1',backtestStats.bollinger.sidewayM1],['ANTI FOMO',backtestStats.fomo],['SESSION',backtestStats.session],['FRIDAY LOCK',backtestStats.friday]].map(([name,st]:any)=>{
+              {[['MA TREND',backtestStats.maTrend],['FOMO',backtestStats.fomo],['SIDEWAY',backtestStats.sideway],['BOLLINGER TREND M15',backtestStats.bollinger.trendM15],['BOLLINGER SIDEWAY M15',backtestStats.bollinger.sidewayM15],['BOLLINGER TREND M1',backtestStats.bollinger.trendM1],['BOLLINGER SIDEWAY M1',backtestStats.bollinger.sidewayM1],['SESSION',backtestStats.session],['FRIDAY LOCK',backtestStats.friday]].map(([name,st]:any)=>{
                 const blockRate = st.checks > 0 ? (st.blocked / st.checks) * 100 : null;
                 const precision = st.blocked > 0 ? (st.correct / st.blocked) * 100 : null;
                 return (
@@ -2871,18 +1647,7 @@ async function start() {
                 );
               })}
             </div>
-            <div className="advisor-row"><div><span>TÍN HIỆU</span><b>{backtestStats.totalSignals}</b></div><div><span>ĐƯỢC VÀO</span><b>{backtestStats.acceptedSignals}</b></div><div><span>MARKET</span><b>{backtestStats.marketEntries}</b></div><div><span>NO TRADE</span><b>{backtestStats.noTrade}</b></div></div>
-            <div className="ai-exit-summary">
-              <div className="ai-exit-head"><span>AI PROFIT EXIT</span><b className={backtestStats.aiExit.enabled ? 'up' : ''}>{backtestStats.aiExit.enabled ? 'ACTIVE' : 'OFF'}</b></div>
-              <div className="ai-exit-grid">
-                <div><span>CHỐT CHỦ ĐỘNG</span><b>{backtestStats.aiExit.closes}</b></div>
-                <div><span>PROTECT</span><b>{backtestStats.aiExit.protects}</b></div>
-                <div><span>HOLD</span><b>{backtestStats.aiExit.holds}</b></div>
-                <div><span>AVG SCORE</span><b>{backtestStats.aiExit.averageScore.toFixed(1)}</b></div>
-                <div><span>AVG PROFIT / EXIT</span><b className={backtestStats.aiExit.averageProfit >= 0 ? 'up' : 'down'}>${backtestStats.aiExit.averageProfit.toFixed(2)}</b></div>
-              </div>
-              <small>AI không đóng chỉ vì profit vừa dương; engine kết hợp trend, momentum, candle, RSI, volatility và mức profit để quyết định HOLD / PROTECT / CLOSE.</small>
-            </div>
+            <div className="advisor-row"><div><span>TÍN HIỆU</span><b>{backtestStats.totalSignals}</b></div><div><span>ĐƯỢC VÀO</span><b>{backtestStats.acceptedSignals}</b></div><div><span>BỎ QUA (ĐANG CÓ LỆNH)</span><b>{backtestStats.skippedOpen}</b></div><div><span>NO TRADE</span><b>{backtestStats.noTrade}</b></div></div>
             <div className="best-config">
               <span>CẤU HÌNH ĐÃ CHẠY</span>
               <b>{data?.lastBacktestConfig || 'Chưa chạy backtest'}</b>
@@ -2891,10 +1656,10 @@ async function start() {
             <div className="recommendations-panel">
               <div className="recommended-head">
                 <div>
-                  <span>AI NEXT EXPERIMENTS</span>
+                  <span>NEXT EXPERIMENTS</span>
                   <strong>Đề xuất cho lần chạy tiếp theo</strong>
                 </div>
-                {recommendations.length > 0 && <small>AI không tự chạy. Em chọn đề xuất nào thì cấu hình đó mới được áp dụng và RUN.</small>}
+                {recommendations.length > 0 && <small>Không tự chạy. Chọn đề xuất nào thì cấu hình đó mới được áp dụng và RUN.</small>}
               </div>
               <div className="recommendation-list">
                 {recommendations.length ? recommendations.map((r, idx) => (
@@ -2902,7 +1667,8 @@ async function start() {
                     <div className="recommendation-top">
                       <div><span>ĐỀ XUẤT #{idx + 1}</span><strong>{r.title}</strong></div>
                       <button className="recommendation-run" disabled={botRunning} onClick={() => {
-                        setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(true);
+                        setFast(r.config.fast); setSlow(r.config.slow); setTrend(r.config.trend); setMaTrendEnabled(r.config.maTrendEnabled);
+                        setRrRisk(r.config.rrRisk); setRrReward(r.config.rrReward);
                         setSideway1Filter(r.config.sideway1Filter);
                         setStrategyMode(r.config.strategyMode || 'ma');
                         setBbTrendM15(r.config.bbTrendM15); setBbSidewayM15(r.config.bbSidewayM15);
@@ -2911,8 +1677,8 @@ async function start() {
                         setBbSlopeM1Pips(r.config.bbSlopeM1Pips); setBbWidthM1(r.config.bbWidthM1);
                         setBbSidewaySlopeM15Pips(r.config.bbSidewaySlopeM15Pips); setBbSidewayWidthM15(r.config.bbSidewayWidthM15);
                         setBbSidewaySlopeM1Pips(r.config.bbSidewaySlopeM1Pips); setBbSidewayWidthM1(r.config.bbSidewayWidthM1);
-setSideway2Filter(false); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
-                        setAiProfitExit(r.config.aiProfitExit); setFridayLock(r.config.fridayLock); setUseLotChain(r.config.useLotChain);
+                        setAntiFomo(r.config.antiFomo); setBreakEven(r.config.breakEven); setTrailing(r.config.trailing);
+                        setFridayLock(r.config.fridayLock); setUseLotChain(r.config.useLotChain);
                         setBaseLot(r.config.baseLot); setUseTradingSession(r.config.useTradingSession); setSessionFrom(r.config.sessionFrom); setSessionTo(r.config.sessionTo);
                         setCustomLotChain(r.config.lotChain.join(', ')); setLotChainMode('custom');
                         void runBot(r.config);
@@ -2922,7 +1688,7 @@ setSideway2Filter(false); setAntiFomo(r.config.antiFomo); setBreakEven(r.config.
                     <div className="recommendation-reason"><b>Vì sao:</b> {r.reason}</div>
                     <div className="recommendation-reason"><b>Mục tiêu kiểm chứng:</b> {r.expected}</div>
                   </div>
-                )) : <div className="muted">Sau mỗi RUN BOT, AI sẽ đưa ra tối đa 3 cấu hình đáng thử tiếp theo.</div>}
+                )) : <div className="muted">Sau mỗi RUN BOT, hệ thống đưa ra tối đa 3 cấu hình đáng thử tiếp theo.</div>}
               </div>
             </div>
 
