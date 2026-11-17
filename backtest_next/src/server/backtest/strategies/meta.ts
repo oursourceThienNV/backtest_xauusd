@@ -18,7 +18,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
       "Sideway TH1: Cross trong ±3 giá Cross của lệnh thua đầu tiên • TH2: Cross trong ±3 giá MA Trend → bỏ",
       "J-K (tùy chọn): độ dốc SMA khung lớn phải nằm trong ngưỡng",
       "SL = đáy/đỉnh 10 nến trước Cross ± 0.1, khoảng SL 3.01–8.99 giá (ngoài khoảng → bỏ lệnh)",
-      "TP = khoảng SL × min(R:R, 0.85)"
+      "TP = khoảng SL × R:R (đúng tỉ lệ nhập)"
     ],
     "presets": {
       "low": {
@@ -314,7 +314,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
       "Trong vòng lặp: nến M15 đóng cùng chiều SMA20 và NGOÀI biên (TĂNG: > Upper, GIẢM: < Lower) → sang M1",
       "M1: Dist Upper − Lower < ngưỡng → sideway, không vào",
       "Cặp nến M1: nến 1 đóng cùng phía SMA20, nến 2 cùng phía + thân ≥ 70% → vào lệnh MARKET",
-      "SL = đáy/đỉnh 10 nến trước nến 2 ± 0.1 (tối đa 10 giá) • TP = khoảng SL × min(R:R, 0.8)",
+      "SL = đáy/đỉnh 10 nến trước nến 2 ± 0.1 (tối đa 10 giá) • TP = khoảng SL × R:R (đúng tỉ lệ nhập)",
       "Lệnh kết thúc → chờ nến M15 ngoài biên mới; vòng lặp kết thúc khi Delta đổi dấu"
     ],
     "fields": [
@@ -481,7 +481,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
       "MUA: giá M1 chọc thủng H1-Low ≥ N pip → chờ nến M1 XANH đóng trên H1-Low",
       "BÁN: giá M1 chọc thủng H1-High ≥ N pip → chờ nến M1 ĐỎ đóng dưới H1-High",
       "MUA đặt BUY STOP = giá đóng cửa đỉnh M1 gần nhất • BÁN đặt SELL STOP = giá đóng cửa đáy M1 gần nhất",
-      "SL = đáy/đỉnh M1 gần nhất ± 0.1, 4–8 giá • TP = SL × min(R:R, 0.75), tối đa 10 giá",
+      "SL = đáy/đỉnh M1 gần nhất ± 0.1, 4–8 giá • TP = khoảng SL × R:R (đúng tỉ lệ nhập)",
       "Mỗi lần chọc thủng 1 lệnh; lệnh chờ chưa khớp khi hết giờ H1 → hủy"
     ],
     "fields": [

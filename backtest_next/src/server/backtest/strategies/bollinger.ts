@@ -9,7 +9,7 @@ import { PIP_TO_PRICE, Strategy, finite, g, getRr, num, seriesPoints, timeText, 
  *   ② Trong vòng lặp: nến M15 đóng cùng chiều SMA20 và NGOÀI biên -> sang M1 (hiệu lực 1 nến M15)
  *   ③ M1: Dist Upper-Lower < ngưỡng -> sideway; cặp nến: nến 1 cùng phía SMA20,
  *        nến 2 cùng phía + thân >= 70% -> vào lệnh MARKET
- *   ④ SL/TP theo 10 nến trước nến 2: SL = đáy/đỉnh ± 0.1 (tối đa 10 giá), TP = SL × min(R:R, 0.8)
+ *   ④ SL/TP theo 10 nến trước nến 2: SL = đáy/đỉnh ± 0.1 (tối đa 10 giá), TP = khoảng SL × R:R (đúng tỉ lệ nhập)
  *   Vòng lặp kết thúc khi dấu Delta đổi.
  */
 
@@ -18,7 +18,6 @@ const BODY_RATIO_MIN = 0.7;
 const SL_LOOKBACK = 10;
 const SL_BUFFER = 0.1;
 const SL_MAX_DISTANCE = 10.0;
-const TP_MAX_RR = 0.8;
 const M15 = 900;
 
 type Trend = 'UP' | 'DOWN';
@@ -66,7 +65,7 @@ export class BollingerStrategy extends Strategy {
     this.widthM1Pips = width!;
     this.rrRisk = risk!;
     this.rrReward = reward!;
-    this.rr = Math.min(rr!, TP_MAX_RR);
+    this.rr = rr!;
 
     [this.mid1, this.up1, this.low1] = bollinger(this.m1.close, BB_PERIOD, 2);
     this.m15 = this.data.bars(M15);

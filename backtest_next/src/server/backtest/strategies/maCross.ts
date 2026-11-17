@@ -12,7 +12,7 @@ import { Strategy, finite, g, getRr, intOrNull, num, seriesPoints, timeText, typ
  *   2.3 ĐỘ DỐC J-K: J = SMA[1]-SMA[2], K = J/(SMA[2]-SMA[3]) - 1
  *   3   Vào MARKET (BUY = Ask, SELL = Bid)
  *   4   SL theo 10 nến trước nến Cross (BUY: Low thấp nhất + 0.1, SELL: High cao nhất - 0.1),
- *       khoảng SL phải 3.01–8.99 giá; TP = khoảng SL × min(R:R, 0.85)
+ *       khoảng SL phải 3.01–8.99 giá; TP = khoảng SL × R:R (đúng tỉ lệ nhập)
  */
 
 const FOMO_BODY_LOOKBACK = 3;
@@ -22,7 +22,6 @@ const SL_LOOKBACK = 10;
 const SL_BUFFER = 0.1;
 const SL_MIN_DISTANCE = 3.01;
 const SL_MAX_DISTANCE = 8.99;
-const TP_MAX_RR = 0.85;
 const JK_TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
 
 export class MaCrossStrategy extends Strategy {
@@ -102,7 +101,7 @@ export class MaCrossStrategy extends Strategy {
     this.slow = slow!;
     this.rrRisk = risk!;
     this.rrReward = reward!;
-    this.rr = Math.min(rr!, TP_MAX_RR);
+    this.rr = rr!;
 
     const close = this.m1.close;
     this.maFast = sma(close, this.fast);

@@ -10,15 +10,13 @@ import { PIP_TO_PRICE, Strategy, g, intOrNull, num, seriesPoints, timeText, type
  *        BÁN : High M1 >= H1-High + N pip -> chờ nến M1 ĐỎ đóng dưới H1-High
  *   3. MUA đặt BUY STOP = giá đóng cửa ĐỈNH M1 gần nhất (trên Ask)
  *      BÁN đặt SELL STOP = giá đóng cửa ĐÁY M1 gần nhất (dưới Bid)  (fractal N nến mỗi bên)
- *   4. SL = đáy/đỉnh M1 gần nhất ± 0.1, khoảng SL 4–8 giá; TP = SL × min(R:R, 0.75), tối đa 10 giá
+ *   4. SL = đáy/đỉnh M1 gần nhất ± 0.1, khoảng SL 4–8 giá; TP = khoảng SL × R:R (đúng tỉ lệ nhập)
  *   5. Mỗi lần chọc thủng 1 lệnh; lệnh chờ chưa khớp khi hết giờ H1 hiện tại -> hủy.
  */
 
 const SL_BUFFER = 0.1;
 const SL_MIN_DISTANCE = 4.0;
 const SL_MAX_DISTANCE = 8.0;
-const TP_MAX_RR = 0.75;
-const TP_MAX_DISTANCE = 10.0;
 const SWING_LOOKBACK = 120;
 const H1 = 3600;
 
@@ -67,7 +65,7 @@ export class AdxStrategy extends Strategy {
     this.adxMax = adxMax!;
     this.pierce = pierce!;
     this.swingBars = swing!;
-    this.rr = Math.min(reward! / risk!, TP_MAX_RR);
+    this.rr = reward! / risk!;
     this.h1 = this.data.bars(H1);
     const fn = method === 'MT5' ? adxMt5 : adxWilder;
     this.adx = fn(this.h1.high, this.h1.low, this.h1.close, this.period);
@@ -185,7 +183,7 @@ export class AdxStrategy extends Strategy {
     }
 
     risk = Math.min(Math.max(risk, SL_MIN_DISTANCE), SL_MAX_DISTANCE);
-    const reward = Math.min(risk * this.rr, TP_MAX_DISTANCE);
+    const reward = risk * this.rr;
     const sl = side === 'BUY' ? entry - risk : entry + risk;
     const tp = side === 'BUY' ? entry + reward : entry - reward;
     if (risk <= 0) return { plan: null, why: `Khoảng SL quá nhỏ (${risk.toFixed(2)})` };

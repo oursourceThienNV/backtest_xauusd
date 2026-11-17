@@ -5,6 +5,9 @@ import mysql, { Pool } from 'mysql2/promise';
 const g = globalThis as unknown as { __backtestPool?: Pool };
 
 function createPool(): Pool {
+  if (!process.env.DB_USER || !process.env.DB_NAME) {
+    throw new Error(`Chưa đọc được DB_USER / DB_NAME từ .env (thư mục chạy: ${process.cwd()}). Kiểm tra file .env rồi chạy lại app.`);
+  }
   return mysql.createPool({
     host: process.env.DB_HOST || '127.0.0.1',
     port: Number(process.env.DB_PORT || 3306),
