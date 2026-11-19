@@ -211,7 +211,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
         "type": "bool",
         "default": false,
         "group": "Quản lý lệnh",
-        "help": "Thắng -> L1, thua -> L2, L3, L4, L5 (giữ L5 tới khi thắng)"
+        "help": "Thắng -> L1, thua -> L2, L3, L4, L5; xong lệnh L5 (thắng hay thua) -> quay lại L1"
       },
       {
         "key": "lots",
@@ -378,7 +378,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
         "type": "bool",
         "default": false,
         "group": "Quản lý lệnh",
-        "help": "Thắng -> L1, thua -> L2, L3, L4, L5 (giữ L5 tới khi thắng)"
+        "help": "Thắng -> L1, thua -> L2, L3, L4, L5; xong lệnh L5 (thắng hay thua) -> quay lại L1"
       },
       {
         "key": "lots",
@@ -574,7 +574,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
         "type": "bool",
         "default": false,
         "group": "Quản lý lệnh",
-        "help": "Thắng -> L1, thua -> L2, L3, L4, L5 (giữ L5 tới khi thắng)"
+        "help": "Thắng -> L1, thua -> L2, L3, L4, L5; xong lệnh L5 (thắng hay thua) -> quay lại L1"
       },
       {
         "key": "lots",
@@ -783,7 +783,7 @@ export const STRATEGY_META: Record<string, StrategyMeta> = {
         "type": "bool",
         "default": false,
         "group": "Quản lý lệnh",
-        "help": "Thắng -> L1, thua -> L2, L3, L4, L5 (giữ L5 tới khi thắng)"
+        "help": "Thắng -> L1, thua -> L2, L3, L4, L5; xong lệnh L5 (thắng hay thua) -> quay lại L1"
       },
       {
         "key": "lots",

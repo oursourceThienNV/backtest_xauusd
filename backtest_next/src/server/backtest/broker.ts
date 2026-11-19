@@ -15,7 +15,7 @@ import type { MarketData } from './data';
  *   Trailing   : đạt Y% quãng Entry->TP -> SL khóa Z% lợi nhuận đang có
  *   SL chỉ dời theo hướng có lợi, có hiệu lực từ tick kế tiếp.
  *
- * Chuỗi lot: thắng (lãi >= 0) -> L1 ; thua -> L2, L3, L4, L5 ; ở L5 thua tiếp -> giữ L5.
+ * Chuỗi lot: thắng (lãi >= 0) -> L1 ; thua -> L2, L3, L4, L5 ; xong lệnh L5 (thắng hay thua) -> quay lại L1.
  */
 
 export type Side = 'BUY' | 'SELL';
@@ -200,8 +200,9 @@ export class Broker {
 
   afterCloseLot(profit: number) {
     if (!this.multiLot || !this.lots.length) return;
-    if (profit >= 0) this.lotIndex = 0; // thắng -> L1
-    else this.lotIndex = Math.min(this.lotIndex + 1, this.lots.length - 1); // thua -> L2, L3...
+    const last = this.lots.length - 1;
+    if (profit >= 0 || this.lotIndex >= last) this.lotIndex = 0; // thắng -> L1 ; lệnh ở L cuối (L5) thắng hay thua -> L1
+    else this.lotIndex += 1; // thua -> L2, L3, L4, L5
   }
 
   // ----------------------------------------------------------
