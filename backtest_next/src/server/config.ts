@@ -18,5 +18,8 @@ export const settings = {
   sessionTzOffsetHours: num(process.env.SESSION_TZ_OFFSET_HOURS, 7),
   // Cache tick / nến theo ngày (đọc DB 1 lần)
   cacheDir: process.env.CACHE_DIR || '.cache',
-  maxBacktestDays: num(process.env.MAX_BACKTEST_DAYS, 62),
+  /** Giới hạn số ngày mỗi lần chạy; 0 = không giới hạn (mặc định) */
+  maxBacktestDays: num(process.env.MAX_BACKTEST_DAYS, 0),
+  /** Số ngày tick giữ sẵn trong RAM để chạy lại nhanh */
+  memCacheDays: num(process.env.TICK_MEM_CACHE_DAYS, 20),
 };

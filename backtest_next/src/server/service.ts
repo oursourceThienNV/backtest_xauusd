@@ -23,7 +23,7 @@ async function symbolOf(prefix?: string | null) {
 function checkRange(fromDay: any, toDay: any): [string, string] {
   if (!DAY_RE.test(String(fromDay)) || !DAY_RE.test(String(toDay))) throw badRequest('Ngày không hợp lệ (YYYY-MM-DD)');
   if (fromDay > toDay) throw badRequest('Ngày bắt đầu phải trước ngày kết thúc');
-  if (daysBetween(fromDay, toDay).length > settings.maxBacktestDays) {
+  if (settings.maxBacktestDays > 0 && daysBetween(fromDay, toDay).length > settings.maxBacktestDays) {
     throw badRequest(`Tối đa ${settings.maxBacktestDays} ngày mỗi lần chạy`);
   }
   return [fromDay, toDay];

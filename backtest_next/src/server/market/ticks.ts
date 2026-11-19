@@ -14,7 +14,6 @@ import { type Bars, type Ticks, barsFromTicks, concatBars, emptyBars, emptyTicks
  */
 
 export const DAY_MS = 86_400_000;
-const MEM_CACHE_DAYS = 40;
 
 export const dayStartMs = (day: string) => Date.parse(`${day}T00:00:00Z`);
 export const msToDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
@@ -45,7 +44,8 @@ const cache: Cache = (g.__tickCache ||= { symbols: new Map(), ticks: new Map(), 
 function remember<T>(map: Map<string, T>, key: string, value: T) {
   map.delete(key);
   map.set(key, value);
-  while (map.size > MEM_CACHE_DAYS) map.delete(map.keys().next().value as string);
+  const limit = Math.max(1, settings.memCacheDays);
+  while (map.size > limit) map.delete(map.keys().next().value as string);
 }
 
 const dayComplete = (day: string) => dayStartMs(day) + DAY_MS <= Date.now() - 600_000;
@@ -63,6 +63,18 @@ function writeArrays(file: string, arrays: Float64Array[]) {
   buf[0] = n;
   arrays.forEach((a, k) => buf.set(a, 1 + k * n));
   fs.writeFileSync(file, Buffer.from(buf.buffer));
+}
+
+/** Chỉ đọc 8 byte đầu file: số tick của ngày. */
+function readCount(file: string): number {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const head = Buffer.alloc(8);
+    fs.readSync(fd, head, 0, 8, 0);
+    return head.readDoubleLE(0);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function readArrays(file: string, count: number): Float64Array[] {
@@ -209,16 +221,67 @@ function concatTicks(parts: Ticks[]): Ticks {
 /** Tick trong [startMs, endMs). */
 export async function ticksRange(symbol: string, startMs: number, endMs: number): Promise<Ticks> {
   if (endMs <= startMs) return emptyTicks();
-  const parts: Ticks[] = [];
+  const days = daysBetween(msToDay(startMs), msToDay(endMs - 1));
+  return days.length <= settings.memCacheDays ? ticksRangeCached(symbol, days, startMs, endMs) : ticksRangeLarge(symbol, days, startMs, endMs);
+}
 
-  for (const day of daysBetween(msToDay(startMs), msToDay(endMs - 1))) {
-    const d = await dayTicks(symbol, day);
-    const lo = lowerBound(d.t, startMs);
-    const hi = lowerBound(d.t, endMs);
-    if (hi > lo) parts.push({ t: d.t.subarray(lo, hi), bid: d.bid.subarray(lo, hi), ask: d.ask.subarray(lo, hi) });
+function cut(d: Ticks, startMs: number, endMs: number): Ticks | null {
+  const lo = lowerBound(d.t, startMs);
+  const hi = lowerBound(d.t, endMs);
+  return hi > lo ? { t: d.t.subarray(lo, hi), bid: d.bid.subarray(lo, hi), ask: d.ask.subarray(lo, hi) } : null;
+}
+
+/** Khoảng ngắn: dùng cache RAM để chạy lại nhanh. */
+async function ticksRangeCached(symbol: string, days: string[], startMs: number, endMs: number) {
+  const parts: Ticks[] = [];
+  for (const day of days) {
+    const p = cut(await dayTicks(symbol, day), startMs, endMs);
+    if (p) parts.push(p);
+  }
+  return parts.length ? concatTicks(parts) : emptyTicks();
+}
+
+/**
+ * Khoảng dài (nhiều tháng / năm): không giữ từng ngày trong RAM.
+ *   Vòng 1: bảo đảm mỗi ngày đã có file cache (tải DB nếu chưa) và lấy số tick.
+ *   Vòng 2: cấp phát đúng 1 lần rồi chép từng ngày vào -> RAM ≈ tổng tick × 24 byte.
+ */
+async function ticksRangeLarge(symbol: string, days: string[], startMs: number, endMs: number) {
+  const counts: number[] = [];
+  const keep = new Map<string, Ticks>(); // ngày chưa ghi được file (ngày hôm nay)
+
+  for (const day of days) {
+    const mem = cache.ticks.get(`${symbol}|${day}`);
+    const file = cachePath('ticks', symbol, day);
+    if (mem) counts.push(mem.t.length);
+    else if (fs.existsSync(file)) counts.push(readCount(file));
+    else {
+      const d = await queryDay(symbol, day);
+      if (dayComplete(day)) writeArrays(file, [d.t, d.bid, d.ask]);
+      else keep.set(day, d);
+      counts.push(d.t.length);
+    }
   }
 
-  return parts.length ? concatTicks(parts) : emptyTicks();
+  const total = counts.reduce((a, b) => a + b, 0);
+  const out = { t: new Float64Array(total), bid: new Float64Array(total), ask: new Float64Array(total) };
+  let o = 0;
+
+  for (const day of days) {
+    let d = cache.ticks.get(`${symbol}|${day}`) || keep.get(day);
+    if (!d) {
+      const [t, bid, ask] = readArrays(cachePath('ticks', symbol, day), 3);
+      d = { t, bid, ask };
+    }
+    const p = cut(d, startMs, endMs);
+    if (!p) continue;
+    out.t.set(p.t, o);
+    out.bid.set(p.bid, o);
+    out.ask.set(p.ask, o);
+    o += p.t.length;
+  }
+
+  return o === total ? out : { t: out.t.subarray(0, o), bid: out.bid.subarray(0, o), ask: out.ask.subarray(0, o) };
 }
 
 /** `limit` tick đầu tiên có time >= fromMs (bỏ qua ngày trống, tìm tối đa maxDays ngày). */
